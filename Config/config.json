@@ -1,0 +1,23 @@
+{
+    "development": {
+      "username": "${DB_USER}",
+      "password": "${DB_PASSWORD}",
+      "database": "${DB_NAME}",
+      "host": "${DB_HOST}",
+      "dialect": "mysql"
+    },
+    "staging": {
+      "username": "${STAGING_DB_USER}",
+      "password": "${STAGING_DB_PASSWORD}",
+      "database": "${STAGING_DB_NAME}",
+      "host": "${STAGING_DB_HOST}",
+      "dialect": "mysql"
+    },
+    "production": {
+      "username": "${PROD_DB_USER}",
+      "password": "${PROD_DB_PASSWORD}",
+      "database": "${PROD_DB_NAME}",
+      "host": "${PROD_DB_HOST}",
+      "dialect": "mysql"
+    }
+  }

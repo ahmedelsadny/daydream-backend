@@ -1,0 +1,2213 @@
+const express = require('express');
+const { 
+  Order, OrderItem, Product, Customer, Branch, User, 
+  Shift, Category, SubCategory, Inventory, sequelize, Sequelize,
+  Refund, Replacement 
+} = require('../models');
+const auth = require('../middleware/auth');
+const { allowRoles, ROLES } = require('../middleware/roles');
+const { Op } = require('sequelize');
+
+const router = express.Router();
+
+// All analytics endpoints are admin-only
+router.use(auth, allowRoles(ROLES.ADMIN));
+
+// Test endpoint to check data availability
+router.get('/test-data', async (req, res) => {
+  try {
+    const ordersCount = await Order.count();
+    const refundsCount = await Refund.count();
+    const replacementsCount = await Replacement.count();
+    const branchesCount = await Branch.count();
+    
+    return res.json({
+      success: true,
+      data: {
+        ordersCount,
+        refundsCount,
+        replacementsCount,
+        branchesCount,
+        hasData: ordersCount > 0
+      }
+    });
+  } catch (error) {
+    console.error('Test data error:', error);
+    return res.status(500).json({
+      message: 'Failed to check test data',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     SalesOverview:
+ *       type: object
+ *       properties:
+ *         totalSales:
+ *           type: number
+ *           format: decimal
+ *         totalOrders:
+ *           type: integer
+ *         averageOrderValue:
+ *           type: number
+ *           format: decimal
+ *         cashSales:
+ *           type: number
+ *           format: decimal
+ *         visaSales:
+ *           type: number
+ *           format: decimal
+ *         totalDiscounts:
+ *           type: number
+ *           format: decimal
+ *         period:
+ *           type: object
+ *           properties:
+ *             startDate:
+ *               type: string
+ *               format: date
+ *             endDate:
+ *               type: string
+ *               format: date
+ *         generatedAt:
+ *           type: string
+ *           format: date-time
+ */
+
+/**
+ * @swagger
+ * /api/v1/analytics/sales-overview:
+ *   get:
+ *     summary: Get overall sales metrics
+ *     description: Returns comprehensive sales overview including total sales, orders, payment methods, and discounts
+ *     tags: [Analytics - Sales]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: branchId
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Filter by specific branch ID
+ *     responses:
+ *       200:
+ *         description: Sales overview data
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   $ref: '#/components/schemas/SalesOverview'
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - Admin access required
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/sales-overview', async (req, res) => {
+  try {
+    const { startDate, endDate, branchId } = req.query;
+
+    // Build where conditions
+    const whereConditions = {
+      status: 'completed'
+    };
+
+    // Add date filtering
+    if (startDate || endDate) {
+      whereConditions.created_at = {};
+      if (startDate) {
+        whereConditions.created_at[Op.gte] = new Date(startDate);
+      }
+      if (endDate) {
+        whereConditions.created_at[Op.lte] = new Date(endDate);
+      }
+    }
+
+    // Add branch filtering
+    if (branchId) {
+      whereConditions.branchId = branchId;
+    }
+
+    // Get sales overview data
+    const salesData = await Order.findAll({
+      attributes: [
+        [sequelize.fn('SUM', sequelize.col('total_price')), 'totalSales'],
+        [sequelize.fn('COUNT', sequelize.col('Order.id')), 'totalOrders'],
+        [sequelize.fn('AVG', sequelize.col('total_price')), 'averageOrderValue'],
+        [sequelize.fn('SUM', sequelize.col('cash_amount')), 'cashSales'],
+        [sequelize.fn('SUM', sequelize.col('visa_amount')), 'visaSales'],
+        [sequelize.fn('SUM', sequelize.col('discount_amount')), 'totalDiscounts']
+      ],
+      where: whereConditions,
+      raw: true
+    });
+
+    const overview = salesData[0] || {
+      totalSales: 0,
+      totalOrders: 0,
+      averageOrderValue: 0,
+      cashSales: 0,
+      visaSales: 0,
+      totalDiscounts: 0
+    };
+
+    return res.json({
+      success: true,
+      data: {
+        totalSales: parseFloat(overview.totalSales) || 0,
+        totalOrders: parseInt(overview.totalOrders) || 0,
+        averageOrderValue: parseFloat(overview.averageOrderValue) || 0,
+        cashSales: parseFloat(overview.cashSales) || 0,
+        visaSales: parseFloat(overview.visaSales) || 0,
+        totalDiscounts: parseFloat(overview.totalDiscounts) || 0,
+        period: {
+          startDate: startDate || null,
+          endDate: endDate || null
+        },
+        generatedAt: new Date()
+      }
+    });
+
+  } catch (error) {
+    console.error('Sales overview error:', error);
+    return res.status(500).json({
+      message: 'Failed to fetch sales overview',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     SalesByPeriod:
+ *       type: object
+ *       properties:
+ *         period:
+ *           type: string
+ *         date:
+ *           type: string
+ *           format: date
+ *         totalSales:
+ *           type: number
+ *           format: decimal
+ *         orderCount:
+ *           type: integer
+ *         averageOrderValue:
+ *           type: number
+ *           format: decimal
+ *         cashSales:
+ *           type: number
+ *           format: decimal
+ *         visaSales:
+ *           type: number
+ *           format: decimal
+ */
+
+/**
+ * @swagger
+ * /api/v1/analytics/sales-by-period:
+ *   get:
+ *     summary: Get sales trends by time period
+ *     description: Returns sales data grouped by daily, weekly, or monthly periods
+ *     tags: [Analytics - Sales]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: period
+ *         schema:
+ *           type: string
+ *           enum: [daily, weekly, monthly]
+ *           default: daily
+ *         description: Time period grouping (daily, weekly, monthly)
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: branchId
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Filter by specific branch ID
+ *     responses:
+ *       200:
+ *         description: Sales trends by period
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/SalesByPeriod'
+ *                 summary:
+ *                   type: object
+ *                   properties:
+ *                     totalPeriods:
+ *                       type: integer
+ *                     periodType:
+ *                       type: string
+ *                     dateRange:
+ *                       type: object
+ *                       properties:
+ *                         startDate:
+ *                           type: string
+ *                           format: date
+ *                         endDate:
+ *                           type: string
+ *                           format: date
+ *                     generatedAt:
+ *                       type: string
+ *                       format: date-time
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - Admin access required
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/sales-by-period', async (req, res) => {
+  try {
+    const { period = 'daily', startDate, endDate, branchId } = req.query;
+
+    // Validate period parameter
+    if (!['daily', 'weekly', 'monthly'].includes(period)) {
+      return res.status(400).json({
+        message: 'Invalid period. Must be daily, weekly, or monthly'
+      });
+    }
+
+    // Set default date range if not provided (last 30 days)
+    const endDateObj = endDate ? new Date(endDate) : new Date();
+    const startDateObj = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    // Build where conditions
+    const whereConditions = {
+      status: 'completed',
+      created_at: {
+        [Op.gte]: startDateObj,
+        [Op.lte]: endDateObj
+      }
+    };
+
+    // Add branch filtering
+    if (branchId) {
+      whereConditions.branchId = branchId;
+    }
+
+    // Determine date grouping function based on period
+    let dateGrouping;
+    let dateFormat;
+    
+    switch (period) {
+      case 'daily':
+        dateGrouping = sequelize.fn('DATE', sequelize.col('created_at'));
+        dateFormat = '%Y-%m-%d';
+        break;
+      case 'weekly':
+        dateGrouping = sequelize.fn('YEARWEEK', sequelize.col('created_at'));
+        dateFormat = '%Y-%u';
+        break;
+      case 'monthly':
+        dateGrouping = sequelize.fn('DATE_FORMAT', sequelize.col('created_at'), '%Y-%m');
+        dateFormat = '%Y-%m';
+        break;
+    }
+
+    // Get sales data by period
+    const salesByPeriod = await Order.findAll({
+      attributes: [
+        [dateGrouping, 'period'],
+        [sequelize.fn('SUM', sequelize.col('total_price')), 'totalSales'],
+        [sequelize.fn('COUNT', sequelize.col('Order.id')), 'orderCount'],
+        [sequelize.fn('AVG', sequelize.col('total_price')), 'averageOrderValue'],
+        [sequelize.fn('SUM', sequelize.col('cash_amount')), 'cashSales'],
+        [sequelize.fn('SUM', sequelize.col('visa_amount')), 'visaSales']
+      ],
+      where: whereConditions,
+      group: [dateGrouping],
+      order: [[dateGrouping, 'ASC']],
+      raw: true
+    });
+
+    // Format the response data
+    const formattedData = salesByPeriod.map(item => ({
+      period: period,
+      date: item.period,
+      totalSales: parseFloat(item.totalSales) || 0,
+      orderCount: parseInt(item.orderCount) || 0,
+      averageOrderValue: parseFloat(item.averageOrderValue) || 0,
+      cashSales: parseFloat(item.cashSales) || 0,
+      visaSales: parseFloat(item.visaSales) || 0
+    }));
+
+    return res.json({
+      success: true,
+      data: formattedData,
+      summary: {
+        totalPeriods: formattedData.length,
+        periodType: period,
+        dateRange: {
+          startDate: startDateObj.toISOString().split('T')[0],
+          endDate: endDateObj.toISOString().split('T')[0]
+        },
+        generatedAt: new Date()
+      }
+    });
+
+  } catch (error) {
+    console.error('Sales by period error:', error);
+    return res.status(500).json({
+      message: 'Failed to fetch sales by period',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     BranchPerformance:
+ *       type: object
+ *       properties:
+ *         branchId:
+ *           type: string
+ *           format: uuid
+ *         branchName:
+ *           type: string
+ *         branchLocation:
+ *           type: string
+ *         totalSales:
+ *           type: number
+ *           format: decimal
+ *         orderCount:
+ *           type: integer
+ *         averageOrderValue:
+ *           type: number
+ *           format: decimal
+ *         cashSales:
+ *           type: number
+ *           format: decimal
+ *         visaSales:
+ *           type: number
+ *           format: decimal
+ *         totalDiscounts:
+ *           type: number
+ *           format: decimal
+ *         salesPercentage:
+ *           type: number
+ *           format: decimal
+ *           description: Percentage of total sales across all branches
+ */
+
+/**
+ * @swagger
+ * /api/v1/analytics/sales-by-branch:
+ *   get:
+ *     summary: Get branch performance comparison
+ *     description: Returns sales performance metrics for each branch
+ *     tags: [Analytics - Sales]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: sortBy
+ *         schema:
+ *           type: string
+ *           enum: [totalSales, orderCount, averageOrderValue]
+ *           default: totalSales
+ *         description: Sort branches by metric
+ *       - in: query
+ *         name: sortOrder
+ *         schema:
+ *           type: string
+ *           enum: [asc, desc]
+ *           default: desc
+ *         description: Sort order (ascending or descending)
+ *     responses:
+ *       200:
+ *         description: Branch performance comparison
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/BranchPerformance'
+ *                 summary:
+ *                   type: object
+ *                   properties:
+ *                     totalBranches:
+ *                       type: integer
+ *                     totalSales:
+ *                       type: number
+ *                       format: decimal
+ *                     averageSalesPerBranch:
+ *                       type: number
+ *                       format: decimal
+ *                     topPerformingBranch:
+ *                       type: object
+ *                       properties:
+ *                         branchId:
+ *                           type: string
+ *                         branchName:
+ *                           type: string
+ *                         sales:
+ *                           type: number
+ *                           format: decimal
+ *                     dateRange:
+ *                       type: object
+ *                       properties:
+ *                         startDate:
+ *                           type: string
+ *                           format: date
+ *                         endDate:
+ *                           type: string
+ *                           format: date
+ *                     generatedAt:
+ *                       type: string
+ *                       format: date-time
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - Admin access required
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/sales-by-branch', async (req, res) => {
+  try {
+    const { startDate, endDate, sortBy = 'totalSales', sortOrder = 'desc' } = req.query;
+
+    // Build where conditions
+    const whereConditions = {
+      status: 'completed'
+    };
+
+    // Add date filtering
+    if (startDate || endDate) {
+      whereConditions.created_at = {};
+      if (startDate) {
+        whereConditions.created_at[Op.gte] = new Date(startDate);
+      }
+      if (endDate) {
+        whereConditions.created_at[Op.lte] = new Date(endDate);
+      }
+    }
+
+    // Get branch performance data
+    const branchPerformance = await Order.findAll({
+      attributes: [
+        'branchId',
+        [sequelize.fn('SUM', sequelize.col('total_price')), 'totalSales'],
+        [sequelize.fn('COUNT', sequelize.col('Order.id')), 'orderCount'],
+        [sequelize.fn('AVG', sequelize.col('total_price')), 'averageOrderValue'],
+        [sequelize.fn('SUM', sequelize.col('cash_amount')), 'cashSales'],
+        [sequelize.fn('SUM', sequelize.col('visa_amount')), 'visaSales'],
+        [sequelize.fn('SUM', sequelize.col('discount_amount')), 'totalDiscounts']
+      ],
+      include: [{
+        model: Branch,
+        attributes: ['id', 'name', 'location']
+      }],
+      where: whereConditions,
+      group: ['branchId', 'Branch.id'],
+      raw: true,
+      nest: true
+    });
+
+    // Calculate total sales across all branches for percentage calculation
+    const totalSalesAcrossBranches = branchPerformance.reduce((sum, branch) => {
+      return sum + (parseFloat(branch.totalSales) || 0);
+    }, 0);
+
+    // Format the response data
+    const formattedData = branchPerformance.map(branch => ({
+      branchId: branch.branchId,
+      branchName: branch.Branch?.name || 'Unknown Branch',
+      branchLocation: branch.Branch?.location || 'Unknown Location',
+      totalSales: parseFloat(branch.totalSales) || 0,
+      orderCount: parseInt(branch.orderCount) || 0,
+      averageOrderValue: parseFloat(branch.averageOrderValue) || 0,
+      cashSales: parseFloat(branch.cashSales) || 0,
+      visaSales: parseFloat(branch.visaSales) || 0,
+      totalDiscounts: parseFloat(branch.totalDiscounts) || 0,
+      salesPercentage: totalSalesAcrossBranches > 0 ? 
+        ((parseFloat(branch.totalSales) || 0) / totalSalesAcrossBranches * 100) : 0
+    }));
+
+    // Sort the data
+    const validSortFields = ['totalSales', 'orderCount', 'averageOrderValue'];
+    if (validSortFields.includes(sortBy)) {
+      formattedData.sort((a, b) => {
+        const aValue = a[sortBy];
+        const bValue = b[sortBy];
+        
+        if (sortOrder === 'asc') {
+          return aValue - bValue;
+        } else {
+          return bValue - aValue;
+        }
+      });
+    }
+
+    // Find top performing branch
+    const topPerformingBranch = formattedData.length > 0 ? formattedData[0] : null;
+
+    return res.json({
+      success: true,
+      data: formattedData,
+      summary: {
+        totalBranches: formattedData.length,
+        totalSales: totalSalesAcrossBranches,
+        averageSalesPerBranch: formattedData.length > 0 ? 
+          totalSalesAcrossBranches / formattedData.length : 0,
+        topPerformingBranch: topPerformingBranch ? {
+          branchId: topPerformingBranch.branchId,
+          branchName: topPerformingBranch.branchName,
+          sales: topPerformingBranch.totalSales
+        } : null,
+        dateRange: {
+          startDate: startDate || null,
+          endDate: endDate || null
+        },
+        generatedAt: new Date()
+      }
+    });
+
+  } catch (error) {
+    console.error('Sales by branch error:', error);
+    return res.status(500).json({
+      message: 'Failed to fetch sales by branch',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     PaymentMethodBreakdown:
+ *       type: object
+ *       properties:
+ *         paymentMethod:
+ *           type: string
+ *           enum: [cash, visa, mixed]
+ *         totalSales:
+ *           type: number
+ *           format: decimal
+ *         orderCount:
+ *           type: integer
+ *         averageOrderValue:
+ *           type: number
+ *           format: decimal
+ *         percentage:
+ *           type: number
+ *           format: decimal
+ *           description: Percentage of total sales
+ *         cashAmount:
+ *           type: number
+ *           format: decimal
+ *           description: Cash portion of sales (for mixed payments)
+ *         visaAmount:
+ *           type: number
+ *           format: decimal
+ *           description: Visa portion of sales (for mixed payments)
+ */
+
+/**
+ * @swagger
+ * /api/v1/analytics/sales-by-payment-method:
+ *   get:
+ *     summary: Get sales breakdown by payment method
+ *     description: Returns sales data grouped by payment methods (cash, visa, mixed)
+ *     tags: [Analytics - Sales]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: branchId
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Filter by specific branch ID
+ *     responses:
+ *       200:
+ *         description: Payment method breakdown
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/PaymentMethodBreakdown'
+ *                 summary:
+ *                   type: object
+ *                   properties:
+ *                     totalSales:
+ *                       type: number
+ *                       format: decimal
+ *                     totalOrders:
+ *                       type: integer
+ *                     paymentMethods:
+ *                       type: object
+ *                       properties:
+ *                         cash:
+ *                           type: object
+ *                           properties:
+ *                             sales:
+ *                               type: number
+ *                               format: decimal
+ *                             percentage:
+ *                               type: number
+ *                               format: decimal
+ *                         visa:
+ *                           type: object
+ *                           properties:
+ *                             sales:
+ *                               type: number
+ *                               format: decimal
+ *                             percentage:
+ *                               type: number
+ *                               format: decimal
+ *                         mixed:
+ *                           type: object
+ *                           properties:
+ *                             sales:
+ *                               type: number
+ *                               format: decimal
+ *                             percentage:
+ *                               type: number
+ *                               format: decimal
+ *                     dateRange:
+ *                       type: object
+ *                       properties:
+ *                         startDate:
+ *                           type: string
+ *                           format: date
+ *                         endDate:
+ *                           type: string
+ *                           format: date
+ *                     generatedAt:
+ *                       type: string
+ *                       format: date-time
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - Admin access required
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/sales-by-payment-method', async (req, res) => {
+  try {
+    const { startDate, endDate, branchId } = req.query;
+
+    // Build where conditions
+    const whereConditions = {
+      status: 'completed'
+    };
+
+    // Add date filtering
+    if (startDate || endDate) {
+      whereConditions.created_at = {};
+      if (startDate) {
+        whereConditions.created_at[Op.gte] = new Date(startDate);
+      }
+      if (endDate) {
+        whereConditions.created_at[Op.lte] = new Date(endDate);
+      }
+    }
+
+    // Add branch filtering
+    if (branchId) {
+      whereConditions.branchId = branchId;
+    }
+
+    // Get payment method breakdown data
+    const paymentBreakdown = await Order.findAll({
+      attributes: [
+        'paymentMethod',
+        [sequelize.fn('SUM', sequelize.col('total_price')), 'totalSales'],
+        [sequelize.fn('COUNT', sequelize.col('Order.id')), 'orderCount'],
+        [sequelize.fn('AVG', sequelize.col('total_price')), 'averageOrderValue'],
+        [sequelize.fn('SUM', sequelize.col('cash_amount')), 'cashAmount'],
+        [sequelize.fn('SUM', sequelize.col('visa_amount')), 'visaAmount']
+      ],
+      where: whereConditions,
+      group: ['paymentMethod'],
+      order: [[sequelize.fn('SUM', sequelize.col('total_price')), 'DESC']],
+      raw: true
+    });
+
+    // Calculate total sales for percentage calculation
+    const totalSales = paymentBreakdown.reduce((sum, method) => {
+      return sum + (parseFloat(method.totalSales) || 0);
+    }, 0);
+
+    const totalOrders = paymentBreakdown.reduce((sum, method) => {
+      return sum + (parseInt(method.orderCount) || 0);
+    }, 0);
+
+    // Format the response data
+    const formattedData = paymentBreakdown.map(method => ({
+      paymentMethod: method.paymentMethod,
+      totalSales: parseFloat(method.totalSales) || 0,
+      orderCount: parseInt(method.orderCount) || 0,
+      averageOrderValue: parseFloat(method.averageOrderValue) || 0,
+      percentage: totalSales > 0 ? ((parseFloat(method.totalSales) || 0) / totalSales * 100) : 0,
+      cashAmount: parseFloat(method.cashAmount) || 0,
+      visaAmount: parseFloat(method.visaAmount) || 0
+    }));
+
+    // Create summary object with payment method breakdowns
+    const summary = {
+      totalSales,
+      totalOrders,
+      paymentMethods: {
+        cash: {
+          sales: formattedData.find(m => m.paymentMethod === 'cash')?.totalSales || 0,
+          percentage: formattedData.find(m => m.paymentMethod === 'cash')?.percentage || 0
+        },
+        visa: {
+          sales: formattedData.find(m => m.paymentMethod === 'visa')?.totalSales || 0,
+          percentage: formattedData.find(m => m.paymentMethod === 'visa')?.percentage || 0
+        },
+        mixed: {
+          sales: formattedData.find(m => m.paymentMethod === 'mixed')?.totalSales || 0,
+          percentage: formattedData.find(m => m.paymentMethod === 'mixed')?.percentage || 0
+        }
+      },
+      dateRange: {
+        startDate: startDate || null,
+        endDate: endDate || null
+      },
+      generatedAt: new Date()
+    };
+
+    return res.json({
+      data: formattedData,
+      summary
+    });
+
+  } catch (error) {
+    console.error('Sales by payment method error:', error);
+    return res.status(500).json({
+      message: 'Failed to fetch sales by payment method',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     TopProduct:
+ *       type: object
+ *       properties:
+ *         productId:
+ *           type: string
+ *           format: uuid
+ *         productName:
+ *           type: string
+ *         sku:
+ *           type: string
+ *         price:
+ *           type: number
+ *           format: decimal
+ *         totalQuantitySold:
+ *           type: integer
+ *         totalRevenue:
+ *           type: number
+ *           format: decimal
+ *         averageOrderValue:
+ *           type: number
+ *           format: decimal
+ *         orderCount:
+ *           type: integer
+ *         categoryName:
+ *           type: string
+ *         subCategoryName:
+ *           type: string
+ */
+
+/**
+ * @swagger
+ * /api/v1/analytics/top-products:
+ *   get:
+ *     summary: Get best selling products
+ *     description: Returns the top performing products by quantity sold or revenue
+ *     tags: [Analytics - Products]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: branchId
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Filter by specific branch ID
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *           minimum: 1
+ *           maximum: 100
+ *         description: Number of top products to return
+ *       - in: query
+ *         name: sortBy
+ *         schema:
+ *           type: string
+ *           enum: [quantity, revenue]
+ *           default: quantity
+ *         description: Sort by quantity sold or revenue generated
+ *       - in: query
+ *         name: categoryId
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Filter by specific category ID
+ *     responses:
+ *       200:
+ *         description: Top selling products
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/TopProduct'
+ *                 summary:
+ *                   type: object
+ *                   properties:
+ *                     totalProducts:
+ *                       type: integer
+ *                     totalQuantitySold:
+ *                       type: integer
+ *                     totalRevenue:
+ *                       type: number
+ *                       format: decimal
+ *                     sortBy:
+ *                       type: string
+ *                     dateRange:
+ *                       type: object
+ *                       properties:
+ *                         startDate:
+ *                           type: string
+ *                           format: date
+ *                         endDate:
+ *                           type: string
+ *                           format: date
+ *                     generatedAt:
+ *                       type: string
+ *                       format: date-time
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - Admin access required
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/top-products', async (req, res) => {
+  try {
+    const { 
+      startDate, 
+      endDate, 
+      branchId, 
+      limit = 10, 
+      sortBy = 'quantity',
+      categoryId 
+    } = req.query;
+
+    // Validate parameters
+    const validSortOptions = ['quantity', 'revenue'];
+    if (!validSortOptions.includes(sortBy)) {
+      return res.status(400).json({
+        message: 'Invalid sortBy parameter. Must be quantity or revenue'
+      });
+    }
+
+    const limitNum = Math.min(Math.max(parseInt(limit) || 10, 1), 100);
+
+    // Build where conditions for orders
+    const orderWhereConditions = {
+      status: 'completed'
+    };
+
+    // Add date filtering
+    if (startDate || endDate) {
+      orderWhereConditions.created_at = {};
+      if (startDate) {
+        orderWhereConditions.created_at[Op.gte] = new Date(startDate);
+      }
+      if (endDate) {
+        orderWhereConditions.created_at[Op.lte] = new Date(endDate);
+      }
+    }
+
+    // Add branch filtering
+    if (branchId) {
+      orderWhereConditions.branchId = branchId;
+    }
+
+    // Build product where conditions
+    const productWhereConditions = {};
+    if (categoryId) {
+      productWhereConditions.categoryId = categoryId;
+    }
+
+    // Get top products data
+    const topProducts = await OrderItem.findAll({
+      attributes: [
+        'productId',
+        [sequelize.fn('SUM', sequelize.col('quantity')), 'totalQuantitySold'],
+        [sequelize.fn('COUNT', sequelize.col('OrderItem.id')), 'orderCount'],
+        [sequelize.fn('SUM', sequelize.literal('quantity * `Product`.`price`')), 'totalRevenue']
+      ],
+      include: [
+        {
+          model: Product,
+          attributes: ['id', 'name', 'sku', 'price'],
+          where: productWhereConditions,
+          include: [
+            {
+              model: Category,
+              attributes: ['name'],
+              required: false
+            },
+            {
+              model: SubCategory,
+              attributes: ['name'],
+              required: false
+            }
+          ]
+        },
+        {
+          model: Order,
+          attributes: [],
+          where: orderWhereConditions
+        }
+      ],
+      group: ['productId', 'Product.id', 'Product.Category.id', 'Product.SubCategory.id'],
+      order: sortBy === 'quantity' ? 
+        [[sequelize.fn('SUM', sequelize.col('quantity')), 'DESC']] :
+        [[sequelize.literal('totalRevenue'), 'DESC']],
+      limit: limitNum,
+      raw: true,
+      nest: true
+    });
+
+    // Calculate totals
+    const totalQuantitySold = topProducts.reduce((sum, product) => {
+      return sum + (parseInt(product.totalQuantitySold) || 0);
+    }, 0);
+
+    const totalRevenue = topProducts.reduce((sum, product) => {
+      return sum + (parseFloat(product.totalRevenue) || 0);
+    }, 0);
+
+    // Format the response data
+    const formattedData = topProducts.map(item => ({
+      productId: item.productId,
+      productName: item.Product?.name || 'Unknown Product',
+      sku: item.Product?.sku || 'Unknown SKU',
+      price: parseFloat(item.Product?.price) || 0,
+      totalQuantitySold: parseInt(item.totalQuantitySold) || 0,
+      totalRevenue: parseFloat(item.totalRevenue) || 0,
+      averageOrderValue: parseFloat(item.totalRevenue) / (parseInt(item.orderCount) || 1),
+      orderCount: parseInt(item.orderCount) || 0,
+      categoryName: item.Product?.Category?.name || 'Uncategorized',
+      subCategoryName: item.Product?.SubCategory?.name || null
+    }));
+
+    return res.json({
+      data: formattedData,
+      summary: {
+        totalProducts: formattedData.length,
+        totalQuantitySold,
+        totalRevenue,
+        sortBy,
+        dateRange: {
+          startDate: startDate || null,
+          endDate: endDate || null
+        },
+        generatedAt: new Date()
+      }
+    });
+
+  } catch (error) {
+    console.error('Top products error:', error);
+    return res.status(500).json({
+      message: 'Failed to fetch top products',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     ProductPerformance:
+ *       type: object
+ *       properties:
+ *         productId:
+ *           type: string
+ *           format: uuid
+ *         productName:
+ *           type: string
+ *         sku:
+ *           type: string
+ *         period:
+ *           type: string
+ *           format: date
+ *         quantitySold:
+ *           type: integer
+ *         revenue:
+ *           type: number
+ *           format: decimal
+ *         orderCount:
+ *           type: integer
+ *         averageOrderValue:
+ *           type: number
+ *           format: decimal
+ */
+
+/**
+ * @swagger
+ * /api/v1/analytics/product-performance:
+ *   get:
+ *     summary: Get product sales trends over time
+ *     description: Returns product performance data grouped by time periods for trend analysis
+ *     tags: [Analytics - Products]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: productId
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Specific product ID to analyze
+ *       - in: query
+ *         name: period
+ *         schema:
+ *           type: string
+ *           enum: [daily, weekly, monthly]
+ *           default: daily
+ *         description: Time period grouping (daily, weekly, monthly)
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: branchId
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Filter by specific branch ID
+ *       - in: query
+ *         name: categoryId
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Filter by specific category ID
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *           minimum: 1
+ *           maximum: 50
+ *         description: Number of top products to analyze (when productId not specified)
+ *     responses:
+ *       200:
+ *         description: Product performance trends
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/ProductPerformance'
+ *                 summary:
+ *                   type: object
+ *                   properties:
+ *                     totalProducts:
+ *                       type: integer
+ *                     periodType:
+ *                       type: string
+ *                     dateRange:
+ *                       type: object
+ *                       properties:
+ *                         startDate:
+ *                           type: string
+ *                           format: date
+ *                         endDate:
+ *                           type: string
+ *                           format: date
+ *                     generatedAt:
+ *                       type: string
+ *                       format: date-time
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - Admin access required
+ *       404:
+ *         description: Product not found (when productId is specified)
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/product-performance', async (req, res) => {
+  try {
+    const { 
+      productId, 
+      period = 'daily', 
+      startDate, 
+      endDate, 
+      branchId, 
+      categoryId,
+      limit = 10 
+    } = req.query;
+
+    // Validate period parameter
+    if (!['daily', 'weekly', 'monthly'].includes(period)) {
+      return res.status(400).json({
+        message: 'Invalid period. Must be daily, weekly, or monthly'
+      });
+    }
+
+    // Set default date range if not provided (last 30 days)
+    const endDateObj = endDate ? new Date(endDate) : new Date();
+    const startDateObj = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    // Build where conditions for orders
+    const orderWhereConditions = {
+      status: 'completed',
+      created_at: {
+        [Op.gte]: startDateObj,
+        [Op.lte]: endDateObj
+      }
+    };
+
+    // Add branch filtering
+    if (branchId) {
+      orderWhereConditions.branchId = branchId;
+    }
+
+    // Build product where conditions
+    const productWhereConditions = {};
+    if (productId) {
+      productWhereConditions.id = productId;
+    }
+    if (categoryId) {
+      productWhereConditions.categoryId = categoryId;
+    }
+
+    // Determine date grouping function based on period
+    let dateGrouping;
+    
+    switch (period) {
+      case 'daily':
+        dateGrouping = sequelize.fn('DATE', sequelize.col('Order.created_at'));
+        break;
+      case 'weekly':
+        dateGrouping = sequelize.fn('YEARWEEK', sequelize.col('Order.created_at'));
+        break;
+      case 'monthly':
+        dateGrouping = sequelize.fn('DATE_FORMAT', sequelize.col('Order.created_at'), '%Y-%m');
+        break;
+    }
+
+    // Get product performance data
+    const productPerformance = await OrderItem.findAll({
+      attributes: [
+        'productId',
+        [dateGrouping, 'period'],
+        [sequelize.fn('SUM', sequelize.col('quantity')), 'quantitySold'],
+        [sequelize.fn('COUNT', sequelize.col('OrderItem.id')), 'orderCount'],
+        [sequelize.fn('SUM', sequelize.literal('quantity * `Product`.`price`')), 'revenue']
+      ],
+      include: [
+        {
+          model: Product,
+          attributes: ['id', 'name', 'sku'],
+          where: productWhereConditions
+        },
+        {
+          model: Order,
+          attributes: [],
+          where: orderWhereConditions
+        }
+      ],
+      group: ['productId', 'Product.id', dateGrouping],
+      order: [
+        ['productId', 'ASC'],
+        [dateGrouping, 'ASC']
+      ],
+      raw: true,
+      nest: true
+    });
+
+    // If specific productId was requested, validate it exists
+    if (productId && productPerformance.length === 0) {
+      const productExists = await Product.findByPk(productId);
+      if (!productExists) {
+        return res.status(404).json({
+          message: 'Product not found'
+        });
+      }
+    }
+
+    // Format the response data
+    const formattedData = productPerformance.map(item => ({
+      productId: item.productId,
+      productName: item.Product?.name || 'Unknown Product',
+      sku: item.Product?.sku || 'Unknown SKU',
+      period: item.period,
+      quantitySold: parseInt(item.quantitySold) || 0,
+      revenue: parseFloat(item.revenue) || 0,
+      orderCount: parseInt(item.orderCount) || 0,
+      averageOrderValue: parseFloat(item.revenue) / (parseInt(item.orderCount) || 1)
+    }));
+
+    // If no specific product was requested, limit to top products
+    if (!productId) {
+      const limitNum = Math.min(Math.max(parseInt(limit) || 10, 1), 50);
+      const productTotals = {};
+      
+      // Calculate totals per product
+      formattedData.forEach(item => {
+        if (!productTotals[item.productId]) {
+          productTotals[item.productId] = {
+            productId: item.productId,
+            productName: item.productName,
+            sku: item.sku,
+            totalQuantitySold: 0,
+            totalRevenue: 0,
+            totalOrderCount: 0
+          };
+        }
+        productTotals[item.productId].totalQuantitySold += item.quantitySold;
+        productTotals[item.productId].totalRevenue += item.revenue;
+        productTotals[item.productId].totalOrderCount += item.orderCount;
+      });
+
+      // Sort by total revenue and take top products
+      const topProductIds = Object.values(productTotals)
+        .sort((a, b) => b.totalRevenue - a.totalRevenue)
+        .slice(0, limitNum)
+        .map(p => p.productId);
+
+      // Filter data to only include top products
+      const filteredData = formattedData.filter(item => 
+        topProductIds.includes(item.productId)
+      );
+
+      return res.json({
+        data: filteredData,
+        summary: {
+          totalProducts: topProductIds.length,
+          periodType: period,
+          dateRange: {
+            startDate: startDateObj.toISOString().split('T')[0],
+            endDate: endDateObj.toISOString().split('T')[0]
+          },
+          generatedAt: new Date()
+        }
+      });
+    }
+
+    return res.json({
+      data: formattedData,
+      summary: {
+        totalProducts: productId ? 1 : new Set(formattedData.map(item => item.productId)).size,
+        periodType: period,
+        dateRange: {
+          startDate: startDateObj.toISOString().split('T')[0],
+          endDate: endDateObj.toISOString().split('T')[0]
+        },
+        generatedAt: new Date()
+      }
+    });
+
+  } catch (error) {
+    console.error('Product performance error:', error);
+    return res.status(500).json({
+      message: 'Failed to fetch product performance',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     CategoryBreakdown:
+ *       type: object
+ *       properties:
+ *         categoryId:
+ *           type: string
+ *           format: uuid
+ *         categoryName:
+ *           type: string
+ *         subCategoryId:
+ *           type: string
+ *           format: uuid
+ *         subCategoryName:
+ *           type: string
+ *         totalSales:
+ *           type: number
+ *           format: decimal
+ *         totalQuantitySold:
+ *           type: integer
+ *         orderCount:
+ *           type: integer
+ *         averageOrderValue:
+ *           type: number
+ *           format: decimal
+ *         percentage:
+ *           type: number
+ *           format: decimal
+ *           description: Percentage of total sales
+ *         productCount:
+ *           type: integer
+ *           description: Number of unique products sold in this category
+ */
+
+
+/**
+ * @swagger
+ * /api/v1/analytics/branch-profit-analysis:
+ *   get:
+ *     summary: Get comprehensive branch profit analysis
+ *     description: Returns detailed profit analysis for each branch including sales, refunds, replacements, and net profit
+ *     tags: [Analytics - Profit]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: branchId
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Filter by specific branch ID
+ *       - in: query
+ *         name: period
+ *         schema:
+ *           type: string
+ *           enum: [daily, weekly, monthly, yearly]
+ *           default: daily
+ *         description: Group results by time period
+ *     responses:
+ *       200:
+ *         description: Branch profit analysis
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       branchId:
+ *                         type: string
+ *                         format: uuid
+ *                       branchName:
+ *                         type: string
+ *                       branchLocation:
+ *                         type: string
+ *                       period:
+ *                         type: string
+ *                       date:
+ *                         type: string
+ *                         format: date
+ *                       grossSales:
+ *                         type: number
+ *                         format: decimal
+ *                       cashSales:
+ *                         type: number
+ *                         format: decimal
+ *                       visaSales:
+ *                         type: number
+ *                         format: decimal
+ *                       mixedSales:
+ *                         type: number
+ *                         format: decimal
+ *                       totalDiscounts:
+ *                         type: number
+ *                         format: decimal
+ *                       refundAmount:
+ *                         type: number
+ *                         format: decimal
+ *                       replacementAmount:
+ *                         type: number
+ *                         format: decimal
+ *                       netProfit:
+ *                         type: number
+ *                         format: decimal
+ *                       profitMargin:
+ *                         type: number
+ *                         format: decimal
+ *                       orderCount:
+ *                         type: integer
+ *                       refundCount:
+ *                         type: integer
+ *                       replacementCount:
+ *                         type: integer
+ *                 summary:
+ *                   type: object
+ *                   properties:
+ *                     totalBranches:
+ *                       type: integer
+ *                     totalGrossSales:
+ *                       type: number
+ *                       format: decimal
+ *                     totalNetProfit:
+ *                       type: number
+ *                       format: decimal
+ *                     overallProfitMargin:
+ *                       type: number
+ *                       format: decimal
+ *                     totalRefunds:
+ *                       type: number
+ *                       format: decimal
+ *                     totalReplacements:
+ *                       type: number
+ *                       format: decimal
+ *                     periodType:
+ *                       type: string
+ *                     dateRange:
+ *                       type: object
+ *                       properties:
+ *                         startDate:
+ *                           type: string
+ *                           format: date
+ *                         endDate:
+ *                           type: string
+ *                           format: date
+ *                     generatedAt:
+ *                       type: string
+ *                       format: date-time
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - Admin access required
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/branch-profit-analysis', async (req, res) => {
+  try {
+    const { startDate, endDate, branchId, period = 'daily' } = req.query;
+
+    // Validate period parameter
+    if (!['daily', 'weekly', 'monthly', 'yearly'].includes(period)) {
+      return res.status(400).json({
+        message: 'Invalid period. Must be daily, weekly, monthly, or yearly'
+      });
+    }
+
+    // Set default date range if not provided
+    const endDateObj = endDate ? new Date(endDate) : new Date();
+    const startDateObj = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    // Build where conditions
+    const whereConditions = {
+      status: 'completed',
+      created_at: {
+        [Op.gte]: startDateObj,
+        [Op.lte]: endDateObj
+      }
+    };
+
+    // Add branch filtering
+    if (branchId) {
+      whereConditions.branchId = branchId;
+    }
+
+    // Determine date grouping function based on period
+    let dateGrouping;
+    
+    switch (period) {
+      case 'daily':
+        dateGrouping = sequelize.fn('DATE', sequelize.col('created_at'));
+        break;
+      case 'weekly':
+        dateGrouping = sequelize.fn('YEARWEEK', sequelize.col('created_at'));
+        break;
+      case 'monthly':
+        dateGrouping = sequelize.fn('DATE_FORMAT', sequelize.col('created_at'), '%Y-%m');
+        break;
+      case 'yearly':
+        dateGrouping = sequelize.fn('YEAR', sequelize.col('created_at'));
+        break;
+    }
+
+    // Get sales data
+    const salesData = await Order.findAll({
+      attributes: [
+        'branchId',
+        [dateGrouping, 'period'],
+        [sequelize.fn('SUM', sequelize.col('total_price')), 'grossSales'],
+        [sequelize.fn('SUM', sequelize.col('cash_amount')), 'cashSales'],
+        [sequelize.fn('SUM', sequelize.col('visa_amount')), 'visaSales'],
+        [sequelize.fn('SUM', sequelize.col('discount_amount')), 'totalDiscounts'],
+        [sequelize.fn('COUNT', sequelize.col('Order.id')), 'orderCount']
+      ],
+      include: [{
+        model: Branch,
+        attributes: ['id', 'name', 'location']
+      }],
+      where: whereConditions,
+      group: ['branchId', 'Branch.id', dateGrouping],
+      raw: true,
+      nest: true
+    });
+
+    // Get refunds data
+    const refundsData = await Refund.findAll({
+      attributes: [
+        'branchId',
+        [dateGrouping, 'period'],
+        [sequelize.fn('SUM', sequelize.col('refund_amount')), 'refundAmount'],
+        [sequelize.fn('COUNT', sequelize.col('Refund.id')), 'refundCount']
+      ],
+      where: {
+        status: 'approved',
+        created_at: {
+          [Op.gte]: startDateObj,
+          [Op.lte]: endDateObj
+        }
+      },
+      group: ['branchId', dateGrouping],
+      raw: true
+    });
+
+    // Get replacements data
+    const replacementsData = await Replacement.findAll({
+      attributes: [
+        'branchId',
+        [dateGrouping, 'period'],
+        [sequelize.fn('SUM', sequelize.col('price_difference')), 'replacementAmount'],
+        [sequelize.fn('COUNT', sequelize.col('Replacement.id')), 'replacementCount']
+      ],
+      where: {
+        status: 'completed',
+        created_at: {
+          [Op.gte]: startDateObj,
+          [Op.lte]: endDateObj
+        }
+      },
+      group: ['branchId', dateGrouping],
+      raw: true
+    });
+
+    // Combine data
+    const profitData = {};
+
+    // Process sales data
+    salesData.forEach(item => {
+      const key = `${item.branchId}-${item.period}`;
+      profitData[key] = {
+        branchId: item.branchId,
+        branchName: item.Branch?.name || 'Unknown Branch',
+        branchLocation: item.Branch?.location || 'Unknown Location',
+        period: item.period,
+        grossSales: parseFloat(item.grossSales) || 0,
+        cashSales: parseFloat(item.cashSales) || 0,
+        visaSales: parseFloat(item.visaSales) || 0,
+        mixedSales: (parseFloat(item.cashSales) || 0) + (parseFloat(item.visaSales) || 0),
+        totalDiscounts: parseFloat(item.totalDiscounts) || 0,
+        orderCount: parseInt(item.orderCount) || 0,
+        refundAmount: 0,
+        replacementAmount: 0,
+        refundCount: 0,
+        replacementCount: 0
+      };
+    });
+
+    // Process refunds data
+    refundsData.forEach(item => {
+      const key = `${item.branchId}-${item.period}`;
+      if (profitData[key]) {
+        profitData[key].refundAmount = parseFloat(item.refundAmount) || 0;
+        profitData[key].refundCount = parseInt(item.refundCount) || 0;
+      }
+    });
+
+    // Process replacements data
+    replacementsData.forEach(item => {
+      const key = `${item.branchId}-${item.period}`;
+      if (profitData[key]) {
+        profitData[key].replacementAmount = parseFloat(item.replacementAmount) || 0;
+        profitData[key].replacementCount = parseInt(item.replacementCount) || 0;
+      }
+    });
+
+    // Calculate net profit and profit margin
+    const formattedData = Object.values(profitData).map(item => {
+      const netProfit = item.grossSales - item.totalDiscounts - item.refundAmount - item.replacementAmount;
+      const profitMargin = item.grossSales > 0 ? (netProfit / item.grossSales * 100) : 0;
+      
+      return {
+        ...item,
+        netProfit,
+        profitMargin
+      };
+    });
+
+    // Calculate summary
+    const totalGrossSales = formattedData.reduce((sum, item) => sum + item.grossSales, 0);
+    const totalNetProfit = formattedData.reduce((sum, item) => sum + item.netProfit, 0);
+    const totalRefunds = formattedData.reduce((sum, item) => sum + item.refundAmount, 0);
+    const totalReplacements = formattedData.reduce((sum, item) => sum + item.replacementAmount, 0);
+    const overallProfitMargin = totalGrossSales > 0 ? (totalNetProfit / totalGrossSales * 100) : 0;
+
+    return res.json({
+      data: formattedData,
+      summary: {
+        totalBranches: new Set(formattedData.map(item => item.branchId)).size,
+        totalGrossSales,
+        totalNetProfit,
+        overallProfitMargin,
+        totalRefunds,
+        totalReplacements,
+        periodType: period,
+        dateRange: {
+          startDate: startDateObj.toISOString().split('T')[0],
+          endDate: endDateObj.toISOString().split('T')[0]
+        },
+        generatedAt: new Date()
+      }
+    });
+
+  } catch (error) {
+    console.error('Branch profit analysis error:', error);
+    return res.status(500).json({
+      message: 'Failed to fetch branch profit analysis',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/analytics/generate-report:
+ *   post:
+ *     summary: Generate comprehensive analytics report
+ *     description: Generates a detailed PDF report with analytics data for specified parameters
+ *     tags: [Analytics - Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - reportType
+ *               - startDate
+ *               - endDate
+ *             properties:
+ *               reportType:
+ *                 type: string
+ *                 enum: [profit, sales, products, payment-methods, comprehensive]
+ *                 description: Type of report to generate
+ *               startDate:
+ *                 type: string
+ *                 format: date
+ *                 description: Start date for report (YYYY-MM-DD)
+ *               endDate:
+ *                 type: string
+ *                 format: date
+ *                 description: End date for report (YYYY-MM-DD)
+ *               branchId:
+ *                 type: string
+ *                 format: uuid
+ *                 description: Filter by specific branch ID (optional)
+ *               period:
+ *                 type: string
+ *                 enum: [daily, weekly, monthly, yearly]
+ *                 default: daily
+ *                 description: Grouping period for data
+ *               includeCharts:
+ *                 type: boolean
+ *                 default: true
+ *                 description: Include charts in the report
+ *               format:
+ *                 type: string
+ *                 enum: [pdf, excel, csv]
+ *                 default: pdf
+ *                 description: Output format of the report
+ *     responses:
+ *       200:
+ *         description: Report generated successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 message:
+ *                   type: string
+ *                 reportId:
+ *                   type: string
+ *                 downloadUrl:
+ *                   type: string
+ *                 generatedAt:
+ *                   type: string
+ *                   format: date-time
+ *       400:
+ *         description: Invalid request parameters
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - Admin access required
+ *       500:
+ *         description: Internal server error
+ */
+router.post('/generate-report', async (req, res) => {
+  try {
+    const { 
+      reportType, 
+      startDate, 
+      endDate, 
+      branchId, 
+      period = 'daily',
+      includeCharts = true,
+      format = 'pdf'
+    } = req.body;
+
+    // Validate required fields
+    if (!reportType || !startDate || !endDate) {
+      return res.status(400).json({
+        message: 'Missing required fields: reportType, startDate, endDate'
+      });
+    }
+
+    // Validate report type
+    const validReportTypes = ['profit', 'sales', 'products', 'payment-methods', 'comprehensive'];
+    if (!validReportTypes.includes(reportType)) {
+      return res.status(400).json({
+        message: 'Invalid reportType. Must be one of: ' + validReportTypes.join(', ')
+      });
+    }
+
+    // Validate format
+    const validFormats = ['pdf', 'excel', 'csv'];
+    if (!validFormats.includes(format)) {
+      return res.status(400).json({
+        message: 'Invalid format. Must be one of: ' + validFormats.join(', ')
+      });
+    }
+
+    // Generate report ID
+    const reportId = `report_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // For now, return a structured response indicating report generation
+    // In a real implementation, you would:
+    // 1. Fetch all required data based on reportType
+    // 2. Generate charts if includeCharts is true
+    // 3. Create the report file (PDF/Excel/CSV)
+    // 4. Store the file and return download URL
+
+    const reportData = {
+      reportId,
+      reportType,
+      parameters: {
+        startDate,
+        endDate,
+        branchId: branchId || 'all',
+        period,
+        includeCharts,
+        format
+      },
+      status: 'generated',
+      downloadUrl: `/api/v1/analytics/download-report/${reportId}`,
+      generatedAt: new Date()
+    };
+
+    // TODO: Implement actual report generation logic here
+    // This would involve:
+    // - Fetching data from multiple analytics endpoints
+    // - Generating charts using a library like Chart.js or similar
+    // - Creating PDF using libraries like Puppeteer, jsPDF, or ExcelJS
+    // - Storing the generated file and providing download access
+
+    return res.json({
+      message: 'Report generation initiated successfully',
+      reportId,
+      downloadUrl: reportData.downloadUrl,
+      generatedAt: reportData.generatedAt,
+      note: 'Report generation is currently a placeholder. Implement actual report generation logic based on your requirements.'
+    });
+
+  } catch (error) {
+    console.error('Report generation error:', error);
+    return res.status(500).json({
+      message: 'Failed to generate report',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/analytics/payment-breakdown:
+ *   get:
+ *     summary: Get detailed payment method breakdown by branch
+ *     description: Returns comprehensive payment method analysis including cash, visa, and mixed payments
+ *     tags: [Analytics - Payments]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date for analytics (YYYY-MM-DD)
+ *       - in: query
+ *         name: branchId
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Filter by specific branch ID
+ *       - in: query
+ *         name: period
+ *         schema:
+ *           type: string
+ *           enum: [daily, weekly, monthly, yearly]
+ *           default: daily
+ *         description: Group results by time period
+ *     responses:
+ *       200:
+ *         description: Payment method breakdown by branch
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       branchId:
+ *                         type: string
+ *                         format: uuid
+ *                       branchName:
+ *                         type: string
+ *                       branchLocation:
+ *                         type: string
+ *                       period:
+ *                         type: string
+ *                       date:
+ *                         type: string
+ *                         format: date
+ *                       cashSales:
+ *                         type: number
+ *                         format: decimal
+ *                       visaSales:
+ *                         type: number
+ *                         format: decimal
+ *                       mixedSales:
+ *                         type: number
+ *                         format: decimal
+ *                       totalSales:
+ *                         type: number
+ *                         format: decimal
+ *                       cashPercentage:
+ *                         type: number
+ *                         format: decimal
+ *                       visaPercentage:
+ *                         type: number
+ *                         format: decimal
+ *                       mixedPercentage:
+ *                         type: number
+ *                         format: decimal
+ *                       orderCount:
+ *                         type: integer
+ *                 summary:
+ *                   type: object
+ *                   properties:
+ *                     totalBranches:
+ *                       type: integer
+ *                     totalSales:
+ *                       type: number
+ *                       format: decimal
+ *                     totalCashSales:
+ *                       type: number
+ *                       format: decimal
+ *                     totalVisaSales:
+ *                       type: number
+ *                       format: decimal
+ *                     totalMixedSales:
+ *                       type: number
+ *                       format: decimal
+ *                     averageCashPercentage:
+ *                       type: number
+ *                       format: decimal
+ *                     averageVisaPercentage:
+ *                       type: number
+ *                       format: decimal
+ *                     averageMixedPercentage:
+ *                       type: number
+ *                       format: decimal
+ *                     periodType:
+ *                       type: string
+ *                     dateRange:
+ *                       type: object
+ *                       properties:
+ *                         startDate:
+ *                           type: string
+ *                           format: date
+ *                         endDate:
+ *                           type: string
+ *                           format: date
+ *                     generatedAt:
+ *                       type: string
+ *                       format: date-time
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - Admin access required
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/payment-breakdown', async (req, res) => {
+  try {
+    const { startDate, endDate, branchId, period = 'daily' } = req.query;
+
+    // Validate period parameter
+    if (!['daily', 'weekly', 'monthly', 'yearly'].includes(period)) {
+      return res.status(400).json({
+        message: 'Invalid period. Must be daily, weekly, monthly, or yearly'
+      });
+    }
+
+    // Set default date range if not provided
+    const endDateObj = endDate ? new Date(endDate) : new Date();
+    const startDateObj = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    // Build where conditions
+    const whereConditions = {
+      status: 'completed',
+      created_at: {
+        [Op.gte]: startDateObj,
+        [Op.lte]: endDateObj
+      }
+    };
+
+    // Add branch filtering
+    if (branchId) {
+      whereConditions.branchId = branchId;
+    }
+
+    // Determine date grouping function based on period
+    let dateGrouping;
+    
+    switch (period) {
+      case 'daily':
+        dateGrouping = sequelize.fn('DATE', sequelize.col('created_at'));
+        break;
+      case 'weekly':
+        dateGrouping = sequelize.fn('YEARWEEK', sequelize.col('created_at'));
+        break;
+      case 'monthly':
+        dateGrouping = sequelize.fn('DATE_FORMAT', sequelize.col('created_at'), '%Y-%m');
+        break;
+      case 'yearly':
+        dateGrouping = sequelize.fn('YEAR', sequelize.col('created_at'));
+        break;
+    }
+
+    // Get payment breakdown data
+    const paymentData = await Order.findAll({
+      attributes: [
+        'branchId',
+        [dateGrouping, 'period'],
+        [sequelize.fn('SUM', sequelize.col('cash_amount')), 'cashSales'],
+        [sequelize.fn('SUM', sequelize.col('visa_amount')), 'visaSales'],
+        [sequelize.fn('COUNT', sequelize.col('Order.id')), 'orderCount']
+      ],
+      include: [{
+        model: Branch,
+        attributes: ['id', 'name', 'location']
+      }],
+      where: whereConditions,
+      group: ['branchId', 'Branch.id', dateGrouping],
+      raw: true,
+      nest: true
+    });
+
+    // Format the response data
+    const formattedData = paymentData.map(item => {
+      const cashSales = parseFloat(item.cashSales) || 0;
+      const visaSales = parseFloat(item.visaSales) || 0;
+      const mixedSales = cashSales + visaSales;
+      const totalSales = cashSales + visaSales;
+      
+      return {
+        branchId: item.branchId,
+        branchName: item.Branch?.name || 'Unknown Branch',
+        branchLocation: item.Branch?.location || 'Unknown Location',
+        period: item.period,
+        cashSales,
+        visaSales,
+        mixedSales,
+        totalSales,
+        cashPercentage: totalSales > 0 ? (cashSales / totalSales * 100) : 0,
+        visaPercentage: totalSales > 0 ? (visaSales / totalSales * 100) : 0,
+        mixedPercentage: totalSales > 0 ? (mixedSales / totalSales * 100) : 0,
+        orderCount: parseInt(item.orderCount) || 0
+      };
+    });
+
+    // Calculate summary
+    const totalSales = formattedData.reduce((sum, item) => sum + item.totalSales, 0);
+    const totalCashSales = formattedData.reduce((sum, item) => sum + item.cashSales, 0);
+    const totalVisaSales = formattedData.reduce((sum, item) => sum + item.visaSales, 0);
+    const totalMixedSales = formattedData.reduce((sum, item) => sum + item.mixedSales, 0);
+
+    const averageCashPercentage = totalSales > 0 ? (totalCashSales / totalSales * 100) : 0;
+    const averageVisaPercentage = totalSales > 0 ? (totalVisaSales / totalSales * 100) : 0;
+    const averageMixedPercentage = totalSales > 0 ? (totalMixedSales / totalSales * 100) : 0;
+
+    return res.json({
+      data: formattedData,
+      summary: {
+        totalBranches: new Set(formattedData.map(item => item.branchId)).size,
+        totalSales,
+        totalCashSales,
+        totalVisaSales,
+        totalMixedSales,
+        averageCashPercentage,
+        averageVisaPercentage,
+        averageMixedPercentage,
+        periodType: period,
+        dateRange: {
+          startDate: startDateObj.toISOString().split('T')[0],
+          endDate: endDateObj.toISOString().split('T')[0]
+        },
+        generatedAt: new Date()
+      }
+    });
+
+  } catch (error) {
+    console.error('Payment breakdown error:', error);
+    return res.status(500).json({
+      message: 'Failed to fetch payment breakdown',
+      error: error.message
+    });
+  }
+});
+
+module.exports = router;
