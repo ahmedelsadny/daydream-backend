@@ -56,6 +56,14 @@ const {
   ExpenseCategory,
   Expense,
   AuditLog,
+  Supplier,
+  SupplierPayment,
+  PurchaseInvoice,
+  PurchaseInvoiceItem,
+  Stocktake,
+  StocktakeItem,
+  DamagedItem,
+  ProductUnit,
 } = db;
 
 if (User) {
@@ -347,6 +355,92 @@ if (AuditLog && User) {
 if (AuditLog && Branch) {
   AuditLog.belongsTo(Branch, { foreignKey: "branchId" });
   Branch.hasMany(AuditLog, { foreignKey: "branchId" });
+}
+
+// ==================== Phase 4: Suppliers, Purchases, Stocktaking, Packaging ====================
+if (Supplier && PurchaseInvoice) {
+  Supplier.hasMany(PurchaseInvoice, { foreignKey: "supplierId" });
+  PurchaseInvoice.belongsTo(Supplier, { as: "supplier", foreignKey: "supplierId" });
+}
+
+if (Supplier && SupplierPayment) {
+  Supplier.hasMany(SupplierPayment, { as: "payments", foreignKey: "supplierId" });
+  SupplierPayment.belongsTo(Supplier, { as: "supplier", foreignKey: "supplierId" });
+}
+
+if (SupplierPayment && Branch) {
+  SupplierPayment.belongsTo(Branch, { foreignKey: "branchId" });
+}
+
+if (SupplierPayment && User) {
+  SupplierPayment.belongsTo(User, { as: "recorder", foreignKey: "recordedBy" });
+}
+
+if (PurchaseInvoice && PurchaseInvoiceItem) {
+  PurchaseInvoice.hasMany(PurchaseInvoiceItem, { as: "items", foreignKey: "purchaseInvoiceId", onDelete: "CASCADE" });
+  PurchaseInvoiceItem.belongsTo(PurchaseInvoice, { foreignKey: "purchaseInvoiceId" });
+}
+
+if (PurchaseInvoice && Branch) {
+  PurchaseInvoice.belongsTo(Branch, { foreignKey: "branchId" });
+}
+
+if (PurchaseInvoice && Warehouse) {
+  PurchaseInvoice.belongsTo(Warehouse, { foreignKey: "warehouseId" });
+}
+
+if (PurchaseInvoice && User) {
+  PurchaseInvoice.belongsTo(User, { as: "receiver", foreignKey: "receivedBy" });
+}
+
+if (PurchaseInvoiceItem && Product) {
+  PurchaseInvoiceItem.belongsTo(Product, { as: "product", foreignKey: "productId" });
+  Product.hasMany(PurchaseInvoiceItem, { foreignKey: "productId" });
+}
+
+if (Stocktake && StocktakeItem) {
+  Stocktake.hasMany(StocktakeItem, { as: "items", foreignKey: "stocktakeId", onDelete: "CASCADE" });
+  StocktakeItem.belongsTo(Stocktake, { foreignKey: "stocktakeId" });
+}
+
+if (Stocktake && Branch) {
+  Stocktake.belongsTo(Branch, { foreignKey: "branchId" });
+}
+
+if (Stocktake && Warehouse) {
+  Stocktake.belongsTo(Warehouse, { foreignKey: "warehouseId" });
+}
+
+if (Stocktake && User) {
+  Stocktake.belongsTo(User, { as: "initiator", foreignKey: "startedBy" });
+  Stocktake.belongsTo(User, { as: "completer", foreignKey: "completedBy" });
+}
+
+if (StocktakeItem && Product) {
+  StocktakeItem.belongsTo(Product, { as: "product", foreignKey: "productId" });
+}
+
+if (DamagedItem && Product) {
+  DamagedItem.belongsTo(Product, { as: "product", foreignKey: "productId" });
+  Product.hasMany(DamagedItem, { foreignKey: "productId" });
+}
+
+if (DamagedItem && Branch) {
+  DamagedItem.belongsTo(Branch, { foreignKey: "branchId" });
+}
+
+if (DamagedItem && Warehouse) {
+  DamagedItem.belongsTo(Warehouse, { foreignKey: "warehouseId" });
+}
+
+if (DamagedItem && User) {
+  DamagedItem.belongsTo(User, { as: "reporter", foreignKey: "reportedBy" });
+  DamagedItem.belongsTo(User, { as: "approver", foreignKey: "approvedBy" });
+}
+
+if (Product && ProductUnit) {
+  Product.hasMany(ProductUnit, { as: "units", foreignKey: "productId", onDelete: "CASCADE" });
+  ProductUnit.belongsTo(Product, { as: "product", foreignKey: "productId" });
 }
 
 db.sequelize = sequelize;

@@ -1,5 +1,5 @@
 const express = require('express');
-const { Order, OrderItem, Product, Customer, Inventory, ProductSerial, Branch, User, CashierDiscount, HeldOrder, sequelize, Sequelize } = require('../models');
+const { Order, OrderItem, Product, Customer, Inventory, ProductSerial, Branch, User, CashierDiscount, HeldOrder, ProductUnit, sequelize, Sequelize } = require('../models');
 const auth = require('../middleware/auth');
 const { allowRoles, ROLES } = require('../middleware/roles');
 const { requireSupervisorPin } = require('../middleware/supervisorPin');
@@ -136,7 +136,7 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
           });
         }
       } else {
-        // Bulk / Supermarket selling (direct by quantity)
+        // Bulk / Supermarket selling (direct by quantity or by packaging unit)
         quantity = parseFloat(item.quantity);
         if (isNaN(quantity) || quantity <= 0) {
           await transaction.rollback();
@@ -145,7 +145,22 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
           });
         }
 
-        // Check branch inventory
+        // Check if item is sold in a bulk packaging unit (carton, pack, etc.)
+        let unitRecord = null;
+        let conversionFactor = 1;
+        if (item.productUnitId) {
+          unitRecord = await ProductUnit.findOne({
+            where: { id: item.productUnitId, productId: product.id, isActive: true },
+            transaction
+          });
+          if (unitRecord) {
+            conversionFactor = parseFloat(unitRecord.conversionFactor) || 1;
+          }
+        }
+
+        const deductQuantity = parseFloat((quantity * conversionFactor).toFixed(3));
+
+        // Check branch inventory against base units
         const branchInventory = await Inventory.findOne({
           where: {
             productId: item.productId,
@@ -155,30 +170,33 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
         });
 
         const availableQty = branchInventory ? parseFloat(branchInventory.quantity) : 0;
-        if (availableQty < quantity) {
+        if (availableQty < deductQuantity) {
           await transaction.rollback();
           return res.status(400).json({
-            message: `Insufficient inventory for product ${product.name}. Available: ${availableQty}, Requested: ${quantity}`
+            message: `Insufficient inventory for product ${product.name}. Available: ${availableQty} pieces, Requested: ${deductQuantity} pieces (${quantity} ${unitRecord ? unitRecord.unitName : 'units'})`
           });
         }
+
+        const unitPrice = unitRecord ? parseFloat(unitRecord.sellingPrice) : parseFloat(product.price);
+        const costPrice = unitRecord && unitRecord.costPrice ? parseFloat(unitRecord.costPrice) : (product.cost ? parseFloat(product.cost) * conversionFactor : null);
+        const itemSubtotal = parseFloat((unitPrice * quantity).toFixed(2));
+        calculatedTotal += itemSubtotal;
+
+        validatedItems.push({
+          productId: item.productId,
+          product: product,
+          quantity: quantity,
+          deductQuantity: deductQuantity,
+          productUnitId: unitRecord ? unitRecord.id : null,
+          unitName: unitRecord ? unitRecord.unitName : (product.unit || 'piece'),
+          unitPrice: unitPrice,
+          costPrice: costPrice,
+          subtotal: itemSubtotal,
+          hasSerials: hasSerials,
+          availableSerials: availableSerials,
+          serials: selectedSerials
+        });
       }
-
-      const unitPrice = parseFloat(product.price);
-      const costPrice = product.cost ? parseFloat(product.cost) : null;
-      const itemSubtotal = unitPrice * quantity;
-      calculatedTotal += itemSubtotal;
-
-      validatedItems.push({
-        productId: item.productId,
-        product: product,
-        quantity: quantity,
-        unitPrice: unitPrice,
-        costPrice: costPrice,
-        subtotal: itemSubtotal,
-        hasSerials: hasSerials,
-        availableSerials: availableSerials,
-        serials: selectedSerials
-      });
     }
 
     // Handle discount calculation
@@ -488,7 +506,8 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
 
       if (inventory) {
         const currentQty = parseFloat(inventory.quantity) || 0;
-        const newQuantity = Math.max(0, currentQty - validatedItem.quantity);
+        const qtyToDeduct = validatedItem.deductQuantity !== undefined ? validatedItem.deductQuantity : validatedItem.quantity;
+        const newQuantity = Math.max(0, currentQty - qtyToDeduct);
         await inventory.update({
           quantity: newQuantity
         }, { transaction });

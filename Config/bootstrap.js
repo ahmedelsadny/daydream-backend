@@ -80,6 +80,32 @@ async function ensureSupermarketSchema(sequelize) {
     if (sequelize.models.AuditLog) {
       await sequelize.models.AuditLog.sync();
     }
+
+    // Phase 4: Suppliers, Purchases, Stocktaking, Waste, Packaging Units
+    if (sequelize.models.Supplier) {
+      await sequelize.models.Supplier.sync();
+    }
+    if (sequelize.models.SupplierPayment) {
+      await sequelize.models.SupplierPayment.sync();
+    }
+    if (sequelize.models.PurchaseInvoice) {
+      await sequelize.models.PurchaseInvoice.sync();
+    }
+    if (sequelize.models.PurchaseInvoiceItem) {
+      await sequelize.models.PurchaseInvoiceItem.sync();
+    }
+    if (sequelize.models.Stocktake) {
+      await sequelize.models.Stocktake.sync();
+    }
+    if (sequelize.models.StocktakeItem) {
+      await sequelize.models.StocktakeItem.sync();
+    }
+    if (sequelize.models.DamagedItem) {
+      await sequelize.models.DamagedItem.sync();
+    }
+    if (sequelize.models.ProductUnit) {
+      await sequelize.models.ProductUnit.sync();
+    }
   } catch (err) {
     console.log('⚠️ [Bootstrap] Schema upgrade warning:', err.message);
   }

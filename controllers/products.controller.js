@@ -1,5 +1,5 @@
 const express = require('express');
-const { Product, Category, SubCategory, Inventory, ProductSerial, Warehouse, Branch, Order, OrderItem, Transfer, sequelize, Sequelize } = require('../models');
+const { Product, Category, SubCategory, Inventory, ProductSerial, Warehouse, Branch, Order, OrderItem, Transfer, ProductUnit, sequelize, Sequelize } = require('../models');
 const { Op } = Sequelize;
 const auth = require('../middleware/auth');
 const { allowRoles, ROLES } = require('../middleware/roles');
@@ -745,6 +745,59 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
       }
 
       return res.json(response);
+    }
+
+    // 3.5 Check Multi-Unit Packaging Barcode (ProductUnit)
+    console.log('Backend: Searching for multi-unit packaging by barcode:', code);
+    const productUnit = await ProductUnit.findOne({
+      where: { barcode: code, isActive: true },
+      include: [
+        {
+          model: Product,
+          as: 'product',
+          include: [
+            { model: Category, as: 'Category', attributes: ['id', 'name'] },
+            { model: SubCategory, as: 'SubCategory', attributes: ['id', 'name'] }
+          ]
+        }
+      ]
+    });
+
+    if (productUnit && productUnit.product) {
+      const parentProduct = productUnit.product;
+      const inventoryWhere = { productId: parentProduct.id };
+      if (branchFilter) inventoryWhere.branchId = branchFilter;
+      const inventory = await Inventory.findAll({ where: inventoryWhere });
+      const totalAvailablePieces = inventory.reduce((sum, inv) => sum + parseFloat(inv.quantity || 0), 0);
+      const conversionFactor = parseFloat(productUnit.conversionFactor) || 1;
+      const totalAvailableUnits = conversionFactor > 0 ? parseFloat((totalAvailablePieces / conversionFactor).toFixed(2)) : 0;
+
+      return res.json({
+        type: 'packaging_unit',
+        isPackagingUnit: true,
+        unit: {
+          id: productUnit.id,
+          unitName: productUnit.unitName,
+          barcode: productUnit.barcode,
+          conversionFactor: conversionFactor,
+          sellingPrice: parseFloat(productUnit.sellingPrice),
+          costPrice: productUnit.costPrice ? parseFloat(productUnit.costPrice) : undefined
+        },
+        product: {
+          id: parentProduct.id,
+          name: parentProduct.name,
+          sku: parentProduct.sku,
+          barcode: parentProduct.barcode,
+          price: parseFloat(parentProduct.price),
+          category: parentProduct.Category ? { id: parentProduct.Category.id, name: parentProduct.Category.name } : null,
+          subCategory: parentProduct.SubCategory ? { id: parentProduct.SubCategory.id, name: parentProduct.SubCategory.name } : null,
+          unit: parentProduct.unit || 'piece',
+          availableInScopePieces: totalAvailablePieces,
+          availableInScopeUnits: totalAvailableUnits
+        },
+        scope: branchFilter ? 'branch' : 'global',
+        branchId: branchFilter
+      });
     }
 
     // 4. Not found
@@ -1990,6 +2043,98 @@ router.get('/:id/quantity/:locationType/:locationId', auth, allowRoles(ROLES.ADM
   } catch (error) {
     console.error('Error fetching product quantity:', error);
     return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// ==================== Multi-Unit Packaging Endpoints ====================
+
+// Add packaging unit to a product (e.g. carton, pack)
+router.post('/:id/units', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { unitName, barcode, conversionFactor, sellingPrice, costPrice } = req.body;
+
+    const product = await Product.findByPk(id);
+    if (!product) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+
+    if (!unitName || !unitName.trim()) {
+      return res.status(400).json({ message: 'unitName is required' });
+    }
+
+    if (!barcode || !barcode.trim()) {
+      return res.status(400).json({ message: 'barcode is required' });
+    }
+
+    const conv = parseFloat(conversionFactor);
+    if (isNaN(conv) || conv <= 0) {
+      return res.status(400).json({ message: 'conversionFactor must be a positive number' });
+    }
+
+    const price = parseFloat(sellingPrice);
+    if (isNaN(price) || price < 0) {
+      return res.status(400).json({ message: 'sellingPrice must be a valid number' });
+    }
+
+    // Ensure barcode is not already used
+    const existingUnit = await ProductUnit.findOne({ where: { barcode: barcode.trim() } });
+    const existingProduct = await Product.findOne({ where: { barcode: barcode.trim() } });
+    if (existingUnit || existingProduct) {
+      return res.status(400).json({ message: 'This barcode is already assigned to another product or packaging unit' });
+    }
+
+    const unit = await ProductUnit.create({
+      productId: product.id,
+      unitName: unitName.trim(),
+      barcode: barcode.trim(),
+      conversionFactor: conv,
+      sellingPrice: price,
+      costPrice: costPrice ? parseFloat(costPrice) : null,
+      isActive: true
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Packaging unit added successfully',
+      unit
+    });
+  } catch (error) {
+    console.error('Error adding packaging unit:', error);
+    return res.status(500).json({ message: 'Internal server error', error: error.message });
+  }
+});
+
+// Get packaging units for a product
+router.get('/:id/units', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const units = await ProductUnit.findAll({
+      where: { productId: id },
+      order: [['conversionFactor', 'ASC']]
+    });
+
+    return res.json({ success: true, units });
+  } catch (error) {
+    console.error('Error fetching packaging units:', error);
+    return res.status(500).json({ message: 'Internal server error', error: error.message });
+  }
+});
+
+// Delete a packaging unit
+router.delete('/units/:unitId', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, res) => {
+  try {
+    const { unitId } = req.params;
+    const unit = await ProductUnit.findByPk(unitId);
+    if (!unit) {
+      return res.status(404).json({ message: 'Packaging unit not found' });
+    }
+
+    await unit.destroy();
+    return res.json({ success: true, message: 'Packaging unit deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting packaging unit:', error);
+    return res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 

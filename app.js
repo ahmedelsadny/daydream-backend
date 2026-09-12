@@ -61,6 +61,14 @@ apiRouter.use('/analytics', require('./controllers/analytics.controller'));
 apiRouter.use('/expenses', require('./controllers/expenses.controller'));
 // Audit Logs routes
 apiRouter.use('/audit-logs', require('./controllers/auditLogs.controller'));
+// Suppliers routes
+apiRouter.use('/suppliers', require('./controllers/suppliers.controller'));
+// Purchases routes
+apiRouter.use('/purchases', require('./controllers/purchases.controller'));
+// Stocktakes routes
+apiRouter.use('/stocktakes', require('./controllers/stocktakes.controller'));
+// Damaged Items routes
+apiRouter.use('/damaged-items', require('./controllers/damagedItems.controller'));
 
 // Mount API v1 router
 app.use('/api/v1', apiRouter);
