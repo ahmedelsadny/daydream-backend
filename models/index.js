@@ -51,6 +51,8 @@ const {
   TransferItem,
   Shift,
   ReceiptSettings,
+  CashTransaction,
+  HeldOrder,
 } = db;
 
 if (User) {
@@ -282,6 +284,36 @@ if (Shift && User) {
 if (Shift && Branch) {
   Shift.belongsTo(Branch, { foreignKey: "branchId" });
   Branch.hasMany(Shift, { foreignKey: "branchId" });
+}
+
+if (CashTransaction && Shift) {
+  CashTransaction.belongsTo(Shift, { foreignKey: "shiftId" });
+  Shift.hasMany(CashTransaction, { foreignKey: "shiftId" });
+}
+
+if (CashTransaction && User) {
+  CashTransaction.belongsTo(User, { as: "cashier", foreignKey: "cashierId" });
+  User.hasMany(CashTransaction, { foreignKey: "cashierId" });
+}
+
+if (CashTransaction && Branch) {
+  CashTransaction.belongsTo(Branch, { foreignKey: "branchId" });
+  Branch.hasMany(CashTransaction, { foreignKey: "branchId" });
+}
+
+if (HeldOrder && Branch) {
+  HeldOrder.belongsTo(Branch, { foreignKey: "branchId" });
+  Branch.hasMany(HeldOrder, { foreignKey: "branchId" });
+}
+
+if (HeldOrder && User) {
+  HeldOrder.belongsTo(User, { as: "cashier", foreignKey: "cashierId" });
+  User.hasMany(HeldOrder, { foreignKey: "cashierId" });
+}
+
+if (HeldOrder && Customer) {
+  HeldOrder.belongsTo(Customer, { foreignKey: "customerId" });
+  Customer.hasMany(HeldOrder, { foreignKey: "customerId" });
 }
 
 db.sequelize = sequelize;

@@ -23,8 +23,9 @@ module.exports = (sequelize, DataTypes) => {
         field: 'branch_id'
       },
       quantity: {
-        type: DataTypes.INTEGER,
-        allowNull: false
+        type: DataTypes.DECIMAL(10, 3),
+        allowNull: false,
+        defaultValue: 0.000
       }
     },
     {

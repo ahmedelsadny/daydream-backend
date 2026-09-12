@@ -157,6 +157,51 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: 0,
         field: 'replacement_subtotal',
         comment: 'Total replacement subtotal before discounts during the shift'
+      },
+      openingBalance: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false,
+        defaultValue: 0.00,
+        field: 'opening_balance',
+        comment: 'Initial cash float in drawer when shift is opened'
+      },
+      closingBalance: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        field: 'closing_balance',
+        comment: 'Actual physical cash counted in drawer at shift close'
+      },
+      expectedBalance: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        field: 'expected_balance',
+        comment: 'Calculated expected cash: opening + cashSales - cashRefunds + cashIn - cashOut'
+      },
+      cashDifference: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        defaultValue: 0.00,
+        field: 'cash_difference',
+        comment: 'Shortage (negative) or surplus (positive): closingBalance - expectedBalance'
+      },
+      cashIn: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false,
+        defaultValue: 0.00,
+        field: 'cash_in',
+        comment: 'Total cash added to drawer during shift (additional float)'
+      },
+      cashOut: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false,
+        defaultValue: 0.00,
+        field: 'cash_out',
+        comment: 'Total cash removed from drawer during shift (petty expense or supervisor drop)'
+      },
+      notes: {
+        type: DataTypes.TEXT,
+        allowNull: true,
+        field: 'notes'
       }
     },
     {

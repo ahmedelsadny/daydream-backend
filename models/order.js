@@ -19,7 +19,7 @@ module.exports = (sequelize, DataTypes) => {
       },
       customerId: {
         type: DataTypes.UUID,
-        allowNull: false,
+        allowNull: true,
         field: 'customer_id'
       },
       subtotal: {
@@ -98,6 +98,17 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.DECIMAL(10, 2),
         allowNull: true,
         field: 'change_amount'
+      },
+      roundingDifference: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        defaultValue: 0.00,
+        field: 'rounding_difference'
+      },
+      orderNotes: {
+        type: DataTypes.TEXT,
+        allowNull: true,
+        field: 'order_notes'
       },
       status: {
         type: DataTypes.ENUM('pending', 'completed', 'cancelled', 'refunded'),

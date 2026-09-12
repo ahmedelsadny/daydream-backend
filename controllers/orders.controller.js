@@ -1,5 +1,5 @@
 const express = require('express');
-const { Order, OrderItem, Product, Customer, Inventory, ProductSerial, Branch, User, CashierDiscount, sequelize, Sequelize } = require('../models');
+const { Order, OrderItem, Product, Customer, Inventory, ProductSerial, Branch, User, CashierDiscount, HeldOrder, sequelize, Sequelize } = require('../models');
 const auth = require('../middleware/auth');
 const { allowRoles, ROLES } = require('../middleware/roles');
 const { Op } = require('sequelize');
@@ -27,10 +27,6 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
     }
 
     // Validate required fields
-    if (!customerId) {
-      await transaction.rollback();
-      return res.status(400).json({ message: 'customerId is required' });
-    }
     if (!paymentMethod || !['cash', 'visa', 'mixed'].includes(paymentMethod)) {
       await transaction.rollback();
       return res.status(400).json({ message: 'paymentMethod must be cash, visa, or mixed' });
@@ -40,38 +36,30 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
       return res.status(400).json({ message: 'items array is required and must not be empty' });
     }
 
-    // Validate customer exists
-    const customer = await Customer.findByPk(customerId, { transaction });
-    if (!customer) {
-      await transaction.rollback();
-      return res.status(404).json({ message: 'Customer not found' });
+    // Validate customer exists if customerId is provided (optional for walk-in customers)
+    let customer = null;
+    if (customerId) {
+      customer = await Customer.findByPk(customerId, { transaction });
+      if (!customer) {
+        await transaction.rollback();
+        return res.status(404).json({ message: 'Customer not found' });
+      }
+      console.log('Backend: Creating order for customer:', customer.name, 'Branch:', req.user.branchId);
+    } else {
+      console.log('Backend: Creating order for Walk-in Customer (no customerId). Branch:', req.user.branchId);
     }
-    console.log('Backend: Creating order for customer:', customer.name, 'Branch:', req.user.branchId);
 
     // Validate items and calculate total
     let calculatedTotal = 0;
     const validatedItems = [];
 
     for (const item of items) {
-      // Validate that serialIds array is provided
-      if (!item.productId || !item.serialIds || !Array.isArray(item.serialIds) || item.serialIds.length === 0) {
+      if (!item.productId) {
         await transaction.rollback();
         return res.status(400).json({
-          message: 'Each item must have productId and serialIds array with at least one serial ID'
+          message: 'Each item must have a productId'
         });
       }
-
-      // Check for duplicate serials in the request
-      const uniqueSerials = [...new Set(item.serialIds)];
-      if (uniqueSerials.length !== item.serialIds.length) {
-        await transaction.rollback();
-        return res.status(400).json({
-          message: 'Cannot sell the same serial twice in one order'
-        });
-      }
-
-      // Derive quantity from number of serials
-      const quantity = item.serialIds.length;
 
       // Get product
       const product = await Product.findByPk(item.productId, { transaction });
@@ -82,64 +70,110 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
         });
       }
 
-      // Check available serials in this branch
-      const availableSerials = await ProductSerial.findAll({
-        where: {
-          productId: item.productId,
-          branchId: req.user.branchId,
-          orderItemId: null  // Only available serials
-        },
-        transaction
-      });
+      const hasSerials = Array.isArray(item.serialIds) && item.serialIds.length > 0;
+      let quantity = 0;
+      let selectedSerials = [];
+      let availableSerials = [];
 
-      if (availableSerials.length < quantity) {
-        await transaction.rollback();
-        return res.status(400).json({
-          message: `Insufficient inventory for product ${product.name}. Available: ${availableSerials.length}, Requested: ${quantity}`
+      if (hasSerials) {
+        // Serial-based selling (fashion / high value electronics)
+        const uniqueSerials = [...new Set(item.serialIds)];
+        if (uniqueSerials.length !== item.serialIds.length) {
+          await transaction.rollback();
+          return res.status(400).json({
+            message: 'Cannot sell the same serial twice in one order'
+          });
+        }
+
+        quantity = item.serialIds.length;
+
+        // Check available serials in this branch
+        availableSerials = await ProductSerial.findAll({
+          where: {
+            productId: item.productId,
+            branchId: req.user.branchId,
+            orderItemId: null
+          },
+          transaction
         });
+
+        if (availableSerials.length < quantity) {
+          await transaction.rollback();
+          return res.status(400).json({
+            message: `Insufficient inventory for product ${product.name}. Available: ${availableSerials.length}, Requested: ${quantity}`
+          });
+        }
+
+        // Validate cashier-provided serials
+        selectedSerials = await ProductSerial.findAll({
+          where: {
+            id: item.serialIds,
+            productId: item.productId,
+            branchId: req.user.branchId,
+            orderItemId: null
+          },
+          transaction,
+          lock: transaction.LOCK.UPDATE
+        });
+
+        if (selectedSerials.length !== item.serialIds.length) {
+          await transaction.rollback();
+          return res.status(400).json({
+            message: `Invalid or unavailable serials for product ${product.name}. Some serials may be already sold, not in your branch, or don't belong to this product.`,
+            productName: product.name,
+            providedSerials: item.serialIds.length,
+            validSerials: selectedSerials.length
+          });
+        }
+
+        const invalidSerials = selectedSerials.filter(s => s.productId !== item.productId);
+        if (invalidSerials.length > 0) {
+          await transaction.rollback();
+          return res.status(400).json({
+            message: `Some serials don't belong to product ${product.name}`
+          });
+        }
+      } else {
+        // Bulk / Supermarket selling (direct by quantity)
+        quantity = parseFloat(item.quantity);
+        if (isNaN(quantity) || quantity <= 0) {
+          await transaction.rollback();
+          return res.status(400).json({
+            message: `Invalid quantity for product ${product.name}. Quantity must be greater than 0`
+          });
+        }
+
+        // Check branch inventory
+        const branchInventory = await Inventory.findOne({
+          where: {
+            productId: item.productId,
+            branchId: req.user.branchId
+          },
+          transaction
+        });
+
+        const availableQty = branchInventory ? parseFloat(branchInventory.quantity) : 0;
+        if (availableQty < quantity) {
+          await transaction.rollback();
+          return res.status(400).json({
+            message: `Insufficient inventory for product ${product.name}. Available: ${availableQty}, Requested: ${quantity}`
+          });
+        }
       }
 
-      // Validate cashier-provided serials
-      const selectedSerials = await ProductSerial.findAll({
-        where: {
-          id: item.serialIds,
-          productId: item.productId,
-          branchId: req.user.branchId,
-          orderItemId: null  // Must be unassigned
-        },
-        transaction,
-        lock: transaction.LOCK.UPDATE
-      });
-
-      // Validate all provided serials are valid and available
-      if (selectedSerials.length !== item.serialIds.length) {
-        await transaction.rollback();
-        return res.status(400).json({
-          message: `Invalid or unavailable serials for product ${product.name}. Some serials may be already sold, not in your branch, or don't belong to this product.`,
-          productName: product.name,
-          providedSerials: item.serialIds.length,
-          validSerials: selectedSerials.length
-        });
-      }
-
-      // Double-check all serials belong to the correct product
-      const invalidSerials = selectedSerials.filter(s => s.productId !== item.productId);
-      if (invalidSerials.length > 0) {
-        await transaction.rollback();
-        return res.status(400).json({
-          message: `Some serials don't belong to product ${product.name}`
-        });
-      }
-
-      const itemSubtotal = parseFloat(product.price) * quantity;
+      const unitPrice = parseFloat(product.price);
+      const costPrice = product.cost ? parseFloat(product.cost) : null;
+      const itemSubtotal = unitPrice * quantity;
       calculatedTotal += itemSubtotal;
 
       validatedItems.push({
         productId: item.productId,
         product: product,
         quantity: quantity,
-        unitPrice: parseFloat(product.price),
+        unitPrice: unitPrice,
+        costPrice: costPrice,
         subtotal: itemSubtotal,
+        hasSerials: hasSerials,
         availableSerials: availableSerials,
         serials: selectedSerials
       });
@@ -386,16 +420,8 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
     console.log('  totalPrice:', totalPrice);
     
     // Calculate total item count for tracking refunds
-    console.log('🔍 Calculating totalItemCount:');
-    console.log('  validatedItems:', validatedItems);
-    console.log('  validatedItems length:', validatedItems ? validatedItems.length : 'undefined');
-    
     const totalItemCount = validatedItems ? validatedItems.reduce((sum, item) => {
-      console.log('  Processing item:', item);
-      console.log('  Item serialIds:', item.serialIds);
-      const itemCount = item.serialIds ? item.serialIds.length : 0;
-      console.log('  Item count:', itemCount);
-      return sum + itemCount;
+      return sum + (Number(item.quantity) || 0);
     }, 0) : 0;
     
     console.log('  Total item count:', totalItemCount);
@@ -403,12 +429,12 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
     const order = await Order.create({
       cashierId: req.user.id,
       branchId: req.user.branchId,
-      customerId: customerId,
+      customerId: customerId || null,
       subtotal: subtotal,
       discountPercentage: discountPercentage > 0 ? discountPercentage : null,
       discountAmount: discountAmount > 0 ? discountAmount : null,
       cashierDiscountId: cashierDiscountId,
-      originalItemCount: totalItemCount,
+      originalItemCount: Math.ceil(totalItemCount),
       refundedItemsCount: 0,
       totalPrice: totalPrice,
       paymentMethod: paymentMethod,
@@ -416,41 +442,40 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
       visaAmount: finalVisaAmount,
       amountPaid: actualAmountPaid,
       changeAmount: changeAmount,
+      roundingDifference: req.body.roundingDifference ? parseFloat(req.body.roundingDifference) : 0.00,
+      orderNotes: req.body.orderNotes || null,
       status: 'completed'
     }, { transaction });
     
     console.log('✅ Order created with ID:', order.id);
-    console.log('✅ Order discount fields:', {
-      discountPercentage: order.discountPercentage,
-      discountAmount: order.discountAmount,
-      subtotal: order.subtotal,
-      totalPrice: order.totalPrice
-    });
-
-    console.log('Backend: Order created with ID:', order.id);
 
     // Create order items and update inventory
     const createdItems = [];
 
     for (const validatedItem of validatedItems) {
-      // Create order item
+      // Create order item with frozen prices
       const orderItem = await OrderItem.create({
         orderId: order.id,
         productId: validatedItem.productId,
-        quantity: validatedItem.quantity
+        quantity: validatedItem.quantity,
+        unitPrice: validatedItem.unitPrice,
+        costPrice: validatedItem.costPrice,
+        totalPrice: validatedItem.subtotal
       }, { transaction });
 
-      // Assign serials to this order item
+      // Assign serials if this item is tracked by serials
       const serialCodes = [];
-      for (const serial of validatedItem.serials) {
-        await serial.update({
-          orderItemId: orderItem.id,
-          note: `sold - order ${order.id}`
-        }, { transaction });
-        serialCodes.push(serial.serialCode);
+      if (validatedItem.hasSerials && validatedItem.serials && validatedItem.serials.length > 0) {
+        for (const serial of validatedItem.serials) {
+          await serial.update({
+            orderItemId: orderItem.id,
+            note: `sold - order ${order.id}`
+          }, { transaction });
+          serialCodes.push(serial.serialCode);
+        }
       }
 
-      // Reduce inventory - find and update the inventory record
+      // Reduce inventory - DO NOT destroy record if 0, keep it for Out of Stock visibility!
       const inventory = await Inventory.findOne({
         where: {
           productId: validatedItem.productId,
@@ -460,14 +485,11 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
       });
 
       if (inventory) {
-        const newQuantity = inventory.quantity - validatedItem.quantity;
-        if (newQuantity > 0) {
-          await inventory.update({
-            quantity: newQuantity
-          }, { transaction });
-        } else {
-          await inventory.destroy({ transaction });
-        }
+        const currentQty = parseFloat(inventory.quantity) || 0;
+        const newQuantity = Math.max(0, currentQty - validatedItem.quantity);
+        await inventory.update({
+          quantity: newQuantity
+        }, { transaction });
       }
 
       createdItems.push({
@@ -477,20 +499,21 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
         sku: validatedItem.product.sku,
         quantity: validatedItem.quantity,
         unitPrice: validatedItem.unitPrice,
+        costPrice: validatedItem.costPrice,
         subtotal: validatedItem.subtotal,
         serials: serialCodes
       });
     }
 
-    // Calculate and award loyalty points (1 point per currency unit spent, rounded down)
-    const pointsEarned = Math.floor(totalPrice);
-
-    // Update customer loyalty points
-    await customer.update({
-      loyaltyPoints: customer.loyaltyPoints + pointsEarned
-    }, { transaction });
-
-    console.log('Backend: Awarded', pointsEarned, 'loyalty points to customer');
+    // Calculate and award loyalty points if customer account is present
+    let pointsEarned = 0;
+    if (customer) {
+      pointsEarned = Math.floor(totalPrice);
+      await customer.update({
+        loyaltyPoints: (customer.loyaltyPoints || 0) + pointsEarned
+      }, { transaction });
+      console.log('Backend: Awarded', pointsEarned, 'loyalty points to customer');
+    }
 
     await transaction.commit();
 
@@ -513,18 +536,20 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
         visaAmount: order.visaAmount ? parseFloat(order.visaAmount) : null,
         amountPaid: parseFloat(order.amountPaid),
         changeAmount: parseFloat(order.changeAmount),
+        roundingDifference: order.roundingDifference ? parseFloat(order.roundingDifference) : 0,
+        orderNotes: order.orderNotes,
         status: order.status,
         createdAt: order.createdAt,
         updatedAt: order.updatedAt
       },
       items: createdItems,
-      customer: {
+      customer: customer ? {
         id: customer.id,
         name: customer.name,
         phone: customer.phone,
-        loyaltyPoints: customer.loyaltyPoints,
+        loyaltyPoints: (customer.loyaltyPoints || 0) + pointsEarned,
         pointsEarned: pointsEarned
-      },
+      } : null,
       message: 'Order created successfully'
     });
 
@@ -949,6 +974,175 @@ router.get('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BRANC
 
   } catch (error) {
     console.error('Error fetching order:', error);
+    return res.status(500).json({
+      message: 'Internal server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// ==================== HOLD & RESUME CART ENDPOINTS ====================
+
+// Hold current cart/order (cashier, branch_manager)
+router.post('/hold', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async (req, res) => {
+  try {
+    if (!req.user.branchId) {
+      return res.status(403).json({ message: 'User is not assigned to any branch' });
+    }
+
+    const { items, customerId, customerName, holdReason, totalAmount } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: 'items array is required and cannot be empty to hold a cart' });
+    }
+
+    let calculatedTotal = 0;
+    if (totalAmount !== undefined && totalAmount !== null) {
+      calculatedTotal = parseFloat(totalAmount) || 0;
+    } else {
+      calculatedTotal = items.reduce((sum, it) => sum + ((parseFloat(it.price || it.unitPrice || 0)) * (parseFloat(it.quantity) || 1)), 0);
+    }
+
+    const heldOrder = await HeldOrder.create({
+      cashierId: req.user.id,
+      branchId: req.user.branchId,
+      customerId: customerId || null,
+      customerName: customerName || null,
+      cartData: items,
+      holdReason: holdReason || 'Customer temporarily stepped away',
+      totalAmount: parseFloat(calculatedTotal.toFixed(2))
+    });
+
+    return res.status(201).json({
+      message: 'Order held successfully',
+      heldOrder: {
+        id: heldOrder.id,
+        cashierId: heldOrder.cashierId,
+        branchId: heldOrder.branchId,
+        customerId: heldOrder.customerId,
+        customerName: heldOrder.customerName,
+        cartData: heldOrder.cartData,
+        holdReason: heldOrder.holdReason,
+        totalAmount: parseFloat(heldOrder.totalAmount),
+        createdAt: heldOrder.createdAt
+      }
+    });
+  } catch (error) {
+    console.error('Error holding order:', error);
+    return res.status(500).json({
+      message: 'Internal server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// List all held orders for the branch (cashier, branch_manager)
+router.get('/held', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER, ROLES.ADMIN), async (req, res) => {
+  try {
+    const branchId = req.user.role === ROLES.ADMIN ? (req.query.branchId || req.user.branchId) : req.user.branchId;
+
+    const whereClause = {};
+    if (branchId) {
+      whereClause.branchId = branchId;
+    }
+
+    const heldOrders = await HeldOrder.findAll({
+      where: whereClause,
+      include: [
+        { model: User, as: 'cashier', attributes: ['id', 'name', 'email'] },
+        { model: Customer, attributes: ['id', 'name', 'phone'] }
+      ],
+      order: [['createdAt', 'DESC']]
+    });
+
+    return res.json({
+      count: heldOrders.length,
+      heldOrders: heldOrders.map(ho => ({
+        id: ho.id,
+        cashier: ho.cashier,
+        customer: ho.Customer,
+        customerName: ho.customerName || ho.Customer?.name,
+        itemsCount: Array.isArray(ho.cartData) ? ho.cartData.length : 0,
+        totalAmount: parseFloat(ho.totalAmount || 0),
+        holdReason: ho.holdReason,
+        cartData: ho.cartData,
+        createdAt: ho.createdAt
+      }))
+    });
+  } catch (error) {
+    console.error('Error fetching held orders:', error);
+    return res.status(500).json({
+      message: 'Internal server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Get a specific held order by ID (cashier, branch_manager)
+router.get('/held/:id', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER, ROLES.ADMIN), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const whereClause = { id };
+    if (req.user.role !== ROLES.ADMIN && req.user.branchId) {
+      whereClause.branchId = req.user.branchId;
+    }
+
+    const heldOrder = await HeldOrder.findOne({
+      where: whereClause,
+      include: [
+        { model: User, as: 'cashier', attributes: ['id', 'name', 'email'] },
+        { model: Customer, attributes: ['id', 'name', 'phone'] }
+      ]
+    });
+
+    if (!heldOrder) {
+      return res.status(404).json({ message: 'Held order not found' });
+    }
+
+    return res.json({
+      heldOrder: {
+        id: heldOrder.id,
+        cashier: heldOrder.cashier,
+        customer: heldOrder.Customer,
+        customerName: heldOrder.customerName || heldOrder.Customer?.name,
+        itemsCount: Array.isArray(heldOrder.cartData) ? heldOrder.cartData.length : 0,
+        totalAmount: parseFloat(heldOrder.totalAmount || 0),
+        holdReason: heldOrder.holdReason,
+        cartData: heldOrder.cartData,
+        createdAt: heldOrder.createdAt
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching held order:', error);
+    return res.status(500).json({
+      message: 'Internal server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Remove/Resume held order (cashier, branch_manager)
+router.delete('/held/:id', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER, ROLES.ADMIN), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const whereClause = { id };
+    if (req.user.role !== ROLES.ADMIN && req.user.branchId) {
+      whereClause.branchId = req.user.branchId;
+    }
+
+    const heldOrder = await HeldOrder.findOne({ where: whereClause });
+    if (!heldOrder) {
+      return res.status(404).json({ message: 'Held order not found' });
+    }
+
+    await heldOrder.destroy();
+
+    return res.json({
+      message: 'Held order removed/resumed successfully',
+      id: id
+    });
+  } catch (error) {
+    console.error('Error deleting held order:', error);
     return res.status(500).json({
       message: 'Internal server error',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined

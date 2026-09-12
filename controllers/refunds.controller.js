@@ -767,19 +767,27 @@ router.post('/admin', auth, allowRoles(ROLES.ADMIN), async (req, res) => {
     const transaction = await sequelize.transaction();
 
     try {
-        const { orderItemId, serialIds, reason, manualRefundAmount, branchId: bodyBranchId } = req.body;
+        const { orderItemId, serialIds, quantity: requestedQty, reason, manualRefundAmount, branchId: bodyBranchId } = req.body;
 
         if (!orderItemId) {
             await transaction.rollback();
             return res.status(400).json({ message: 'orderItemId is required' });
         }
 
-        if (!serialIds || !Array.isArray(serialIds) || serialIds.length === 0) {
-            await transaction.rollback();
-            return res.status(400).json({ message: 'serialIds array is required and must not be empty' });
-        }
+        const hasSerials = Array.isArray(serialIds) && serialIds.length > 0;
+        let quantity = 0;
 
-        const quantity = serialIds.length;
+        if (hasSerials) {
+            quantity = serialIds.length;
+        } else {
+            quantity = parseFloat(requestedQty);
+            if (isNaN(quantity) || quantity <= 0) {
+                await transaction.rollback();
+                return res.status(400).json({ 
+                    message: 'Either serialIds array or a valid positive quantity must be provided' 
+                });
+            }
+        }
 
         const orderItem = await OrderItem.findByPk(orderItemId, {
             include: [
@@ -822,10 +830,12 @@ router.post('/admin', auth, allowRoles(ROLES.ADMIN), async (req, res) => {
             });
         }
 
-        if (quantity > orderItem.quantity) {
+        const orderItemQty = parseFloat(orderItem.quantity);
+
+        if (quantity > orderItemQty) {
             await transaction.rollback();
             return res.status(400).json({
-                message: `Cannot refund more than purchased quantity. Purchased: ${orderItem.quantity}, Requested: ${quantity}`
+                message: `Cannot refund more than purchased quantity. Purchased: ${orderItemQty}, Requested: ${quantity}`
             });
         }
 
@@ -833,34 +843,37 @@ router.post('/admin', auth, allowRoles(ROLES.ADMIN), async (req, res) => {
             where: { orderItemId: orderItemId },
             transaction
         });
-        const totalRefundedQuantity = existingRefunds.reduce((sum, r) => sum + r.quantity, 0);
-        if (totalRefundedQuantity + quantity > orderItem.quantity) {
+        const totalRefundedQuantity = existingRefunds.reduce((sum, r) => sum + parseFloat(r.quantity || 0), 0);
+        if (totalRefundedQuantity + quantity > orderItemQty) {
             await transaction.rollback();
             return res.status(400).json({
-                message: `Cannot refund more than available quantity. Available: ${orderItem.quantity - totalRefundedQuantity}, Requested: ${quantity}`
+                message: `Cannot refund more than available quantity. Available: ${orderItemQty - totalRefundedQuantity}, Requested: ${quantity}`
             });
         }
 
-        const serialsToRefund = await ProductSerial.findAll({
-            where: {
-                id: serialIds,
-                orderItemId: orderItemId,
-                productId: orderItem.productId
-            },
-            transaction
-        });
-
-        if (serialsToRefund.length !== serialIds.length) {
-            await transaction.rollback();
-            return res.status(400).json({
-                message: `Invalid serials provided. Some serials don't belong to this order item or don't exist. Provided: ${serialIds.length}, Valid: ${serialsToRefund.length}`
+        let serialsToRefund = [];
+        if (hasSerials) {
+            serialsToRefund = await ProductSerial.findAll({
+                where: {
+                    id: serialIds,
+                    orderItemId: orderItemId,
+                    productId: orderItem.productId
+                },
+                transaction
             });
-        }
 
-        const uniqueSerials = [...new Set(serialIds)];
-        if (uniqueSerials.length !== serialIds.length) {
-            await transaction.rollback();
-            return res.status(400).json({ message: 'Cannot refund the same serial twice' });
+            if (serialsToRefund.length !== serialIds.length) {
+                await transaction.rollback();
+                return res.status(400).json({
+                    message: `Invalid serials provided. Some serials don't belong to this order item or don't exist. Provided: ${serialIds.length}, Valid: ${serialsToRefund.length}`
+                });
+            }
+
+            const uniqueSerials = [...new Set(serialIds)];
+            if (uniqueSerials.length !== serialIds.length) {
+                await transaction.rollback();
+                return res.status(400).json({ message: 'Cannot refund the same serial twice' });
+            }
         }
 
         const order = await Order.findByPk(orderItem.Order.id, {
@@ -877,7 +890,8 @@ router.post('/admin', auth, allowRoles(ROLES.ADMIN), async (req, res) => {
                 await order.update({ refundedItemsCount: newRefundedCount }, { transaction });
             }
         } else {
-            refundAmount = parseFloat(orderItem.Product.price) * quantity;
+            const itemUnitPrice = orderItem.unitPrice ? parseFloat(orderItem.unitPrice) : parseFloat(orderItem.Product.price);
+            refundAmount = itemUnitPrice * quantity;
             if (order) {
                 if (order.originalItemCount === null || order.originalItemCount === undefined || order.originalItemCount === 0) {
                     const totalOrderItems = order.OrderItems ? order.OrderItems.reduce((sum, item) => sum + item.quantity, 0) : 0;
@@ -924,7 +938,8 @@ router.post('/admin', auth, allowRoles(ROLES.ADMIN), async (req, res) => {
             transaction
         });
         if (inventory) {
-            await inventory.update({ quantity: inventory.quantity + quantity }, { transaction });
+            const currentQty = parseFloat(inventory.quantity) || 0;
+            await inventory.update({ quantity: currentQty + parseFloat(quantity) }, { transaction });
         } else {
             await Inventory.create({
                 productId: orderItem.productId,
@@ -933,11 +948,13 @@ router.post('/admin', auth, allowRoles(ROLES.ADMIN), async (req, res) => {
             }, { transaction });
         }
 
-        for (const serial of serialsToRefund) {
-            await serial.update({
-                orderItemId: null,
-                note: `refunded - refund ${refund.id}`
-            }, { transaction });
+        if (hasSerials && serialsToRefund && serialsToRefund.length > 0) {
+            for (const serial of serialsToRefund) {
+                await serial.update({
+                    orderItemId: null,
+                    note: `refunded - refund ${refund.id}`
+                }, { transaction });
+            }
         }
 
         await transaction.commit();
@@ -1259,7 +1276,7 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
     const transaction = await sequelize.transaction();
 
     try {
-        const { orderItemId, serialIds, reason, manualRefundAmount } = req.body;
+        const { orderItemId, serialIds, quantity: requestedQty, reason, manualRefundAmount } = req.body;
 
         // Validate required fields
         if (!orderItemId) {
@@ -1267,12 +1284,20 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
             return res.status(400).json({ message: 'orderItemId is required' });
         }
 
-        if (!serialIds || !Array.isArray(serialIds) || serialIds.length === 0) {
-            await transaction.rollback();
-            return res.status(400).json({ message: 'serialIds array is required and must not be empty' });
-        }
+        const hasSerials = Array.isArray(serialIds) && serialIds.length > 0;
+        let quantity = 0;
 
-        const quantity = serialIds.length;
+        if (hasSerials) {
+            quantity = serialIds.length;
+        } else {
+            quantity = parseFloat(requestedQty);
+            if (isNaN(quantity) || quantity <= 0) {
+                await transaction.rollback();
+                return res.status(400).json({ 
+                    message: 'Either serialIds array or a valid positive quantity must be provided' 
+                });
+            }
+        }
 
         // Ensure user has a branch assigned
         if (!req.user.branchId) {
@@ -1330,11 +1355,13 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
             });
         }
 
+        const orderItemQty = parseFloat(orderItem.quantity);
+
         // Validate quantity
-        if (quantity > orderItem.quantity) {
+        if (quantity > orderItemQty) {
             await transaction.rollback();
             return res.status(400).json({
-                message: `Cannot refund more than purchased quantity. Purchased: ${orderItem.quantity}, Requested: ${quantity}`
+                message: `Cannot refund more than purchased quantity. Purchased: ${orderItemQty}, Requested: ${quantity}`
             });
         }
 
@@ -1345,40 +1372,43 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
         });
 
         // Calculate total already refunded quantity
-        const totalRefundedQuantity = existingRefunds.reduce((sum, refund) => sum + refund.quantity, 0);
+        const totalRefundedQuantity = existingRefunds.reduce((sum, refund) => sum + parseFloat(refund.quantity || 0), 0);
         
         // Check if trying to refund more than available
-        if (totalRefundedQuantity + quantity > orderItem.quantity) {
+        if (totalRefundedQuantity + quantity > orderItemQty) {
             await transaction.rollback();
             return res.status(400).json({
-                message: `Cannot refund more than available quantity. Available: ${orderItem.quantity - totalRefundedQuantity}, Requested: ${quantity}`
+                message: `Cannot refund more than available quantity. Available: ${orderItemQty - totalRefundedQuantity}, Requested: ${quantity}`
             });
         }
 
-        // Validate that the provided serials belong to this order item
-        const serialsToRefund = await ProductSerial.findAll({
-            where: {
-                id: serialIds,
-                orderItemId: orderItemId,
-                productId: orderItem.productId
-            },
-            transaction
-        });
-
-        if (serialsToRefund.length !== serialIds.length) {
-            await transaction.rollback();
-            return res.status(400).json({
-                message: `Invalid serials provided. Some serials don't belong to this order item or don't exist. Provided: ${serialIds.length}, Valid: ${serialsToRefund.length}`
+        // Validate serials if serial-based refund
+        let serialsToRefund = [];
+        if (hasSerials) {
+            serialsToRefund = await ProductSerial.findAll({
+                where: {
+                    id: serialIds,
+                    orderItemId: orderItemId,
+                    productId: orderItem.productId
+                },
+                transaction
             });
-        }
 
-        // Check for duplicate serials in the request
-        const uniqueSerials = [...new Set(serialIds)];
-        if (uniqueSerials.length !== serialIds.length) {
-            await transaction.rollback();
-            return res.status(400).json({
-                message: 'Cannot refund the same serial twice'
-            });
+            if (serialsToRefund.length !== serialIds.length) {
+                await transaction.rollback();
+                return res.status(400).json({
+                    message: `Invalid serials provided. Some serials don't belong to this order item or don't exist. Provided: ${serialIds.length}, Valid: ${serialsToRefund.length}`
+                });
+            }
+
+            // Check for duplicate serials in the request
+            const uniqueSerials = [...new Set(serialIds)];
+            if (uniqueSerials.length !== serialIds.length) {
+                await transaction.rollback();
+                return res.status(400).json({
+                    message: 'Cannot refund the same serial twice'
+                });
+            }
         }
 
         // Get order for tracking refunded items count (needed regardless of manual/automatic calculation)
@@ -1404,8 +1434,9 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
                 }, { transaction });
             }
         } else {
-            // Fallback to automatic calculation (original logic)
-            refundAmount = parseFloat(orderItem.Product.price) * quantity;
+            // Fallback to automatic calculation (use frozen unitPrice if available)
+            const itemUnitPrice = orderItem.unitPrice ? parseFloat(orderItem.unitPrice) : parseFloat(orderItem.Product.price);
+            refundAmount = itemUnitPrice * quantity;
             console.log('Using automatic refund calculation:', refundAmount);
             
             if (order) {
@@ -1504,8 +1535,9 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
         });
 
         if (inventory) {
+            const currentQty = parseFloat(inventory.quantity) || 0;
             await inventory.update({
-                quantity: inventory.quantity + quantity
+                quantity: currentQty + parseFloat(quantity)
             }, { transaction });
         } else {
             inventory = await Inventory.create({
@@ -1515,12 +1547,14 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
             }, { transaction });
         }
 
-        // Unassign serials from order item
-        for (const serial of serialsToRefund) {
-            await serial.update({
-                orderItemId: null,
-                note: `refunded - refund ${refund.id}`
-            }, { transaction });
+        // Unassign serials from order item if serial-tracked
+        if (hasSerials && serialsToRefund && serialsToRefund.length > 0) {
+            for (const serial of serialsToRefund) {
+                await serial.update({
+                    orderItemId: null,
+                    note: `refunded - refund ${refund.id}`
+                }, { transaction });
+            }
         }
 
         await transaction.commit();

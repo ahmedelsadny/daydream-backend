@@ -8,7 +8,7 @@ const createError = require('http-errors');
 
 const { server, logging } = require('./Config');
 const db = require('./models');
-const { ensureAdminUser } = require('./Config/bootstrap');
+const { ensureAdminUser, ensureSupermarketSchema } = require('./Config/bootstrap');
 const apiRouter = express.Router();
 
 const app = express();
@@ -101,8 +101,9 @@ if (require.main === module) {
       await db.sequelize.authenticate();
       console.log('✅ Database connected successfully!');
 
-      // Auto sync is now disabled - use migrations instead
+      // Auto sync models
       await db.sequelize.sync();
+      await ensureSupermarketSchema(db.sequelize);
 
       console.log('🔄 Ensuring admin user exists...');
       await ensureAdminUser();

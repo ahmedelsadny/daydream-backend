@@ -91,6 +91,13 @@ router.post('/', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, 
     shoeSize, 
     color, 
     gender, 
+    barcode,
+    unit,
+    isWeighted,
+    scaleCode,
+    minAlertLimit,
+    isFavorite,
+    generateSerials,
     // Handle both old single-location format and new multi-location format
     warehouseId, 
     quantity,
@@ -108,7 +115,7 @@ router.post('/', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, 
   }
 
   // Calculate total quantity across all entries
-  const totalQuantity = inventoryList.reduce((sum, item) => sum + (parseInt(item.quantity) || 0), 0);
+  const totalQuantity = inventoryList.reduce((sum, item) => sum + (parseFloat(item.quantity) || 0), 0);
 
   // Validate required fields
   if (!name || !name.trim()) {
@@ -126,9 +133,7 @@ router.post('/', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, 
   if (!cost || cost <= 0) {
     return res.status(400).json({ message: 'cost is required and must be greater than 0' });
   }
-  if (!gender || !['Men', 'Women', 'Unisex', 'Kids'].includes(gender)) {
-    return res.status(400).json({ message: 'gender is required and must be Men, Women, Unisex, or Kids' });
-  }
+  const finalGender = gender && ['Men', 'Women', 'Unisex', 'Kids'].includes(gender) ? gender : 'Unisex';
   if (totalQuantity <= 0) {
     return res.status(400).json({ message: 'total quantity must be greater than 0 across all locations' });
   }
@@ -171,30 +176,55 @@ router.post('/', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, 
     const nextSeq = String(maxSkuSeq + 1).padStart(3, '0');
     let sku = `${skuPattern}-${nextSeq}`;
     
-    // Generate product barcode in a dialect-agnostic way
-    const isSqlite = sequelize.getDialect() === 'sqlite';
-    const barcodeAttr = isSqlite
-      ? sequelize.literal('MAX(CAST(SUBSTR(barcode, 2, 11) AS INTEGER))')
-      : sequelize.literal('MAX(CAST(SUBSTR(barcode, 2, 11) AS UNSIGNED))');
+    // Handle barcode (use external factory barcode if provided, else generate dialect-agnostic EAN-13)
+    let productBarcode = null;
+    if (barcode && String(barcode).trim()) {
+      productBarcode = String(barcode).trim();
+      const existingProduct = await Product.findOne({ where: { barcode: productBarcode }, transaction });
+      if (existingProduct) {
+        await transaction.rollback();
+        return res.status(400).json({ message: `Barcode ${productBarcode} is already in use by product: ${existingProduct.name}` });
+      }
+    } else {
+      const isSqlite = sequelize.getDialect() === 'sqlite';
+      const barcodeAttr = isSqlite
+        ? sequelize.literal('MAX(CAST(SUBSTR(barcode, 2, 11) AS INTEGER))')
+        : sequelize.literal('MAX(CAST(SUBSTR(barcode, 2, 11) AS UNSIGNED))');
 
-    const barcodeQueryOptions = {
-      attributes: [[barcodeAttr, 'maxSeq']],
-      raw: true,
-      transaction
-    };
-    if (!isSqlite) {
-      barcodeQueryOptions.lock = transaction.LOCK.UPDATE;
+      const barcodeQueryOptions = {
+        attributes: [[barcodeAttr, 'maxSeq']],
+        raw: true,
+        transaction
+      };
+      if (!isSqlite) {
+        barcodeQueryOptions.lock = transaction.LOCK.UPDATE;
+      }
+
+      const [maxProductRow] = await Product.findAll(barcodeQueryOptions);
+      const nextProductSeq = (maxProductRow?.maxSeq || 0) + 1;
+      const productBarcodeBase = `1${String(nextProductSeq).padStart(11, '0')}`;
+      productBarcode = productBarcodeBase + generateEAN13CheckDigit(productBarcodeBase);
     }
 
-    const [maxProductRow] = await Product.findAll(barcodeQueryOptions);
-    const nextProductSeq = (maxProductRow?.maxSeq || 0) + 1;
-    const productBarcodeBase = `1${String(nextProductSeq).padStart(11, '0')}`;
-    const productBarcode = productBarcodeBase + generateEAN13CheckDigit(productBarcodeBase);
-
-    // Create product
+    // Create product with supermarket attributes
     const product = await Product.create({
-      name, sku, barcode: productBarcode, price, cost, categoryId, subCategoryId,
-      size: size || null, shoeSize: shoeSize || null, color, gender, currency
+      name,
+      sku,
+      barcode: productBarcode,
+      price,
+      cost,
+      categoryId,
+      subCategoryId,
+      size: size || null,
+      shoeSize: shoeSize || null,
+      color: color || null,
+      gender: finalGender,
+      currency: currency || 'EGP',
+      unit: unit || 'piece',
+      isWeighted: isWeighted === true || isWeighted === 'true',
+      scaleCode: scaleCode || null,
+      minAlertLimit: minAlertLimit || null,
+      isFavorite: isFavorite === true || isFavorite === 'true'
     }, { transaction });
 
     // Generate batch ID for all serials created in this request
@@ -247,23 +277,26 @@ router.post('/', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, 
       }, { transaction });
       createdInventory.push(inventory);
 
-      // Create serials for this location
-      for (let i = 0; i < qty; i++) {
-        const serialBarcodeBase = `2${String(currentSerialSeq).padStart(11, '0')}`;
-        const serialBarcode = serialBarcodeBase + generateEAN13CheckDigit(serialBarcodeBase);
-        const humanSerialCode = `${sku}-${String(i + 1).padStart(4, '0')}`;
-        
-        const serial = await ProductSerial.create({
-          productId: product.id,
-          serialCode: serialBarcode,
-          note: `initial_stock - ${warehouseId ? 'warehouse' : 'branch'} ${warehouseId || branchId} (${humanSerialCode})`,
-          warehouseId: warehouseId || null,
-          branchId: branchId || null,
-          batchId: batchId
-        }, { transaction });
-        
-        createdSerials.push(serial);
-        currentSerialSeq++;
+      // Create serials for this location only if requested or traditional fashion product
+      const shouldCreateSerials = generateSerials === true || (!isWeighted && isWeighted !== 'true' && generateSerials !== false && unit !== 'kg' && unit !== 'g');
+      if (shouldCreateSerials) {
+        for (let i = 0; i < qty; i++) {
+          const serialBarcodeBase = `2${String(currentSerialSeq).padStart(11, '0')}`;
+          const serialBarcode = serialBarcodeBase + generateEAN13CheckDigit(serialBarcodeBase);
+          const humanSerialCode = `${sku}-${String(i + 1).padStart(4, '0')}`;
+          
+          const serial = await ProductSerial.create({
+            productId: product.id,
+            serialCode: serialBarcode,
+            note: `initial_stock - ${warehouseId ? 'warehouse' : 'branch'} ${warehouseId || branchId} (${humanSerialCode})`,
+            warehouseId: warehouseId || null,
+            branchId: branchId || null,
+            batchId: batchId
+          }, { transaction });
+          
+          createdSerials.push(serial);
+          currentSerialSeq++;
+        }
       }
     }
 
@@ -415,6 +448,59 @@ router.get('/', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, r
   }
 });
 
+// Get quick-touch favorite products for POS cashier screen (all roles)
+router.get('/favorites', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (req, res) => {
+  try {
+    const branchFilter = req.user.branchId || (req.query.branchId || null);
+
+    const favoriteProducts = await Product.findAll({
+      where: {
+        isFavorite: true
+      },
+      include: [
+        { model: Category, as: 'Category', attributes: ['id', 'name'] },
+        { model: SubCategory, as: 'SubCategory', attributes: ['id', 'name'] }
+      ],
+      order: [['name', 'ASC']]
+    });
+
+    const formattedFavorites = await Promise.all(favoriteProducts.map(async (prod) => {
+      let availableQty = 0;
+      if (branchFilter) {
+        const branchInv = await Inventory.findOne({
+          where: { productId: prod.id, branchId: branchFilter }
+        });
+        availableQty = branchInv ? parseFloat(branchInv.quantity || 0) : 0;
+      }
+
+      return {
+        id: prod.id,
+        name: prod.name,
+        sku: prod.sku,
+        barcode: prod.barcode,
+        price: parseFloat(prod.price),
+        cost: (req.user.role === ROLES.ADMIN || req.user.role === ROLES.STOCK_KEEPER) ? parseFloat(prod.cost || 0) : undefined,
+        currency: prod.currency,
+        unit: prod.unit || 'piece',
+        isWeighted: prod.isWeighted || false,
+        scaleCode: prod.scaleCode,
+        isFavorite: true,
+        category: prod.Category ? { id: prod.Category.id, name: prod.Category.name } : null,
+        subCategory: prod.SubCategory ? { id: prod.SubCategory.id, name: prod.SubCategory.name } : null,
+        availableQuantity: availableQty
+      };
+    }));
+
+    return res.json({
+      count: formattedFavorites.length,
+      favorites: formattedFavorites
+    });
+  } catch (error) {
+    console.error('Error fetching favorite products:', error);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 // Search products by barcode (product or serial) - all roles with branch filtering
 router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (req, res) => {
   try {
@@ -442,74 +528,99 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
       console.log('Backend: Global search for', req.user.role);
     }
 
-    // Detect barcode type by first character
-    if (code.startsWith('1')) {
-      // Product barcode search
-      console.log('Backend: Searching for product barcode');
-      
-      const product = await Product.findOne({
-        where: { barcode: code },
+    // 1. Scale Barcode check (GS1 in-store variable measure prefix 20 or 21)
+    const isScaleBarcode = (code.startsWith('20') || code.startsWith('21')) && (code.length === 12 || code.length === 13);
+    if (isScaleBarcode) {
+      console.log('Backend: Detected scale barcode:', code);
+      const rawItemCode = code.substring(2, 7); // 5-digit PLU code
+      const rawWeight = code.substring(7, 12);   // 5-digit weight in grams
+      const parsedScaleCode = String(parseInt(rawItemCode, 10)); // e.g. "123"
+      const weightKg = parseFloat(rawWeight) / 1000; // e.g. 0.450 kg
+
+      let product = await Product.findOne({
+        where: {
+          [Op.or]: [
+            { scaleCode: parsedScaleCode },
+            { scaleCode: rawItemCode },
+            { barcode: code }
+          ]
+        },
         include: [
-          {
-            model: Category,
-            as: 'Category',
-            attributes: ['id', 'name']
-          },
-          {
-            model: SubCategory,
-            as: 'SubCategory',
-            attributes: ['id', 'name']
-          }
+          { model: Category, as: 'Category', attributes: ['id', 'name'] },
+          { model: SubCategory, as: 'SubCategory', attributes: ['id', 'name'] }
         ]
       });
 
-      if (!product) {
-        return res.status(404).json({ 
-          message: 'Product not found with this barcode',
-          type: 'product'
+      if (product) {
+        const inventoryWhere = { productId: product.id };
+        if (branchFilter) inventoryWhere.branchId = branchFilter;
+        const inventory = await Inventory.findAll({ where: inventoryWhere });
+        const totalAvailable = inventory.reduce((sum, inv) => sum + parseFloat(inv.quantity || 0), 0);
+        const unitPrice = parseFloat(product.price);
+        const calculatedTotal = parseFloat((unitPrice * weightKg).toFixed(2));
+
+        return res.json({
+          type: 'scale_product',
+          isScaleBarcode: true,
+          scaleCode: parsedScaleCode,
+          weight: weightKg,
+          calculatedTotal: calculatedTotal,
+          product: {
+            id: product.id,
+            name: product.name,
+            sku: product.sku,
+            barcode: product.barcode,
+            price: unitPrice,
+            cost: (req.user.role === ROLES.ADMIN || req.user.role === ROLES.STOCK_KEEPER) ? parseFloat(product.cost) : undefined,
+            currency: product.currency,
+            category: product.Category ? { id: product.Category.id, name: product.Category.name } : null,
+            subCategory: product.SubCategory ? { id: product.SubCategory.id, name: product.SubCategory.name } : null,
+            unit: product.unit || 'kg',
+            isWeighted: true,
+            availableInScope: totalAvailable
+          },
+          scope: branchFilter ? 'branch' : 'global',
+          branchId: branchFilter
         });
       }
+    }
 
-      // Get available serials in scope (branch or global)
+    // 2. Direct Product Barcode or SKU Search (any barcode: 622, 1..., etc.)
+    console.log('Backend: Searching for product by barcode or SKU:', code);
+    const product = await Product.findOne({
+      where: {
+        [Op.or]: [
+          { barcode: code },
+          { sku: code }
+        ]
+      },
+      include: [
+        { model: Category, as: 'Category', attributes: ['id', 'name'] },
+        { model: SubCategory, as: 'SubCategory', attributes: ['id', 'name'] }
+      ]
+    });
+
+    if (product) {
+      // Get available serials in scope (if product is serial-tracked)
       const serialsWhere = {
         productId: product.id,
-        orderItemId: null  // Only available serials
+        orderItemId: null
       };
-      
-      if (branchFilter) {
-        serialsWhere.branchId = branchFilter;
-      }
+      if (branchFilter) serialsWhere.branchId = branchFilter;
 
       const availableSerials = await ProductSerial.findAll({
         where: serialsWhere,
         include: [
-          {
-            model: Warehouse,
-            as: 'Warehouse',
-            attributes: ['id', 'name', 'type']
-          },
-          {
-            model: Branch,
-            as: 'Branch',
-            attributes: ['id', 'name', 'location']
-          }
+          { model: Warehouse, as: 'Warehouse', attributes: ['id', 'name', 'type'] },
+          { model: Branch, as: 'Branch', attributes: ['id', 'name', 'location'] }
         ],
         order: [['createdAt', 'ASC']]
       });
 
-      // Get inventory count
       const inventoryWhere = { productId: product.id };
-      if (branchFilter) {
-        inventoryWhere.branchId = branchFilter;
-      }
-
-      const inventory = await Inventory.findAll({
-        where: inventoryWhere
-      });
-
-      const totalAvailable = inventory.reduce((sum, inv) => sum + inv.quantity, 0);
-
-      console.log('Backend: Found product with', availableSerials.length, 'available serials');
+      if (branchFilter) inventoryWhere.branchId = branchFilter;
+      const inventory = await Inventory.findAll({ where: inventoryWhere });
+      const totalAvailable = inventory.reduce((sum, inv) => sum + parseFloat(inv.quantity || 0), 0);
 
       return res.json({
         type: 'product',
@@ -521,18 +632,15 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
           price: parseFloat(product.price),
           cost: (req.user.role === ROLES.ADMIN || req.user.role === ROLES.STOCK_KEEPER) ? parseFloat(product.cost) : undefined,
           currency: product.currency,
-          category: product.Category ? {
-            id: product.Category.id,
-            name: product.Category.name
-          } : null,
-          subCategory: product.SubCategory ? {
-            id: product.SubCategory.id,
-            name: product.SubCategory.name
-          } : null,
+          category: product.Category ? { id: product.Category.id, name: product.Category.name } : null,
+          subCategory: product.SubCategory ? { id: product.SubCategory.id, name: product.SubCategory.name } : null,
           size: product.size,
           shoeSize: product.shoeSize,
           color: product.color,
           gender: product.gender,
+          unit: product.unit || 'piece',
+          isWeighted: product.isWeighted || false,
+          scaleCode: product.scaleCode,
           isPrinted: product.isPrinted,
           availableInScope: totalAvailable
         },
@@ -556,86 +664,33 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
         scope: branchFilter ? 'branch' : 'global',
         branchId: branchFilter
       });
+    }
 
-    } else if (code.startsWith('2')) {
-      // Serial barcode search
-      console.log('Backend: Searching for serial barcode');
-      
-      const serialWhere = { serialCode: code };
-      if (branchFilter) {
-        serialWhere.branchId = branchFilter;
-      }
+    // 3. Serial Barcode search (if not found by product barcode/sku, check serials)
+    console.log('Backend: Searching for serial barcode:', code);
+    const serialWhere = { serialCode: code };
+    if (branchFilter) serialWhere.branchId = branchFilter;
 
-      const serial = await ProductSerial.findOne({
-        where: serialWhere,
-        include: [
-          {
-            model: Product,
-            as: 'Product',
-            include: [
-              {
-                model: Category,
-                as: 'Category',
-                attributes: ['id', 'name']
-              },
-              {
-                model: SubCategory,
-                as: 'SubCategory',
-                attributes: ['id', 'name']
-              }
-            ]
-          },
-          {
-            model: require('../models').Warehouse,
-            as: 'Warehouse',
-            attributes: ['id', 'name', 'type']
-          },
-          {
-            model: require('../models').Branch,
-            as: 'Branch',
-            attributes: ['id', 'name', 'location']
-          },
-          {
-            model: OrderItem,
-            as: 'OrderItem',
-            include: [
-              {
-                model: Order,
-                as: 'Order',
-                attributes: ['id', 'status', 'createdAt']
-              }
-            ]
-          }
-        ]
-      });
+    const serial = await ProductSerial.findOne({
+      where: serialWhere,
+      include: [
+        {
+          model: Product,
+          as: 'Product',
+          include: [
+            { model: Category, as: 'Category', attributes: ['id', 'name'] },
+            { model: SubCategory, as: 'SubCategory', attributes: ['id', 'name'] }
+          ]
+        },
+        { model: require('../models').Warehouse, as: 'Warehouse', attributes: ['id', 'name', 'type'] },
+        { model: require('../models').Branch, as: 'Branch', attributes: ['id', 'name', 'location'] },
+        { model: OrderItem, as: 'OrderItem', include: [{ model: Order, as: 'Order' }] }
+      ]
+    });
 
-      if (!serial) {
-        // Check if serial exists in another branch
-        if (branchFilter) {
-          const serialElsewhere = await ProductSerial.findOne({
-            where: { serialCode: code }
-          });
-          
-          if (serialElsewhere) {
-            return res.status(404).json({ 
-              message: 'Serial not found in your branch. It may exist in another location.',
-              type: 'serial',
-              available: false
-            });
-          }
-        }
-        
-        return res.status(404).json({ 
-          message: 'Serial not found with this barcode',
-          type: 'serial'
-        });
-      }
-
+    if (serial) {
+      const serialProduct = serial.Product;
       const status = serial.orderItemId ? 'sold' : 'available';
-      const product = serial.Product;
-
-      console.log('Backend: Found serial with status:', status);
-
       const response = {
         type: 'serial',
         serial: {
@@ -647,25 +702,22 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
           batchId: serial.batchId
         },
         product: {
-          id: product.id,
-          name: product.name,
-          sku: product.sku,
-          barcode: product.barcode,
-          price: parseFloat(product.price),
-          cost: (req.user.role === ROLES.ADMIN || req.user.role === ROLES.STOCK_KEEPER) ? parseFloat(product.cost) : undefined,
-          currency: product.currency,
-          category: product.Category ? {
-            id: product.Category.id,
-            name: product.Category.name
-          } : null,
-          subCategory: product.SubCategory ? {
-            id: product.SubCategory.id,
-            name: product.SubCategory.name
-          } : null,
-          size: product.size,
-          shoeSize: product.shoeSize,
-          color: product.color,
-          gender: product.gender
+          id: serialProduct.id,
+          name: serialProduct.name,
+          sku: serialProduct.sku,
+          barcode: serialProduct.barcode,
+          price: parseFloat(serialProduct.price),
+          cost: (req.user.role === ROLES.ADMIN || req.user.role === ROLES.STOCK_KEEPER) ? parseFloat(serialProduct.cost) : undefined,
+          currency: serialProduct.currency,
+          category: serialProduct.Category ? { id: serialProduct.Category.id, name: serialProduct.Category.name } : null,
+          subCategory: serialProduct.SubCategory ? { id: serialProduct.SubCategory.id, name: serialProduct.SubCategory.name } : null,
+          size: serialProduct.size,
+          shoeSize: serialProduct.shoeSize,
+          color: serialProduct.color,
+          gender: serialProduct.gender,
+          unit: serialProduct.unit || 'piece',
+          isWeighted: serialProduct.isWeighted || false,
+          scaleCode: serialProduct.scaleCode
         },
         location: serial.Warehouse ? {
           type: 'warehouse',
@@ -677,11 +729,11 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
           name: serial.Branch.name,
           location: serial.Branch.location
         } : null,
+        status: status,
         scope: branchFilter ? 'branch' : 'global',
         branchId: branchFilter
       };
 
-      // If sold, add order info and error
       if (status === 'sold' && serial.OrderItem) {
         response.order = {
           id: serial.OrderItem.Order.id,
@@ -693,14 +745,13 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
       }
 
       return res.json(response);
-
-    } else {
-      // Invalid barcode format
-      return res.status(400).json({ 
-        message: 'Invalid barcode format. Expected product barcode (starts with 1) or serial barcode (starts with 2)',
-        providedCode: code
-      });
     }
+
+    // 4. Not found
+    return res.status(404).json({ 
+      message: 'Product or serial not found with this code',
+      providedCode: code
+    });
 
   } catch (error) {
     console.error('Error searching by barcode:', error);
@@ -1462,18 +1513,14 @@ router.put('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
           }
 
           // Update inventory
-          const newQuantity = inventory.quantity - Number(quantity);
-          if (newQuantity > 0) {
-            await inventory.update({ quantity: newQuantity }, { transaction });
-            updatedInventory.push({ 
-              id: inventory.id, 
-              warehouseId: inventory.warehouseId, 
-              branchId: inventory.branchId, 
-              quantity: newQuantity 
-            });
-          } else {
-            await inventory.destroy({ transaction });
-          }
+          const newQuantity = Math.max(0, inventory.quantity - Number(quantity));
+          await inventory.update({ quantity: newQuantity }, { transaction });
+          updatedInventory.push({ 
+            id: inventory.id, 
+            warehouseId: inventory.warehouseId, 
+            branchId: inventory.branchId, 
+            quantity: newQuantity 
+          });
 
         } else {
           // Not printed: Random deletion (existing logic)
@@ -1523,13 +1570,9 @@ router.put('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
               await serial.destroy({ transaction });
             }
 
-            const newQuantity = invRecord.quantity - deleteFromThisLocation;
-            if (newQuantity > 0) {
-              await invRecord.update({ quantity: newQuantity }, { transaction });
-              updatedInventory.push({ id: invRecord.id, warehouseId: invRecord.warehouseId, branchId: invRecord.branchId, quantity: newQuantity });
-            } else {
-              await invRecord.destroy({ transaction });
-            }
+            const newQuantity = Math.max(0, invRecord.quantity - deleteFromThisLocation);
+            await invRecord.update({ quantity: newQuantity }, { transaction });
+            updatedInventory.push({ id: invRecord.id, warehouseId: invRecord.warehouseId, branchId: invRecord.branchId, quantity: newQuantity });
 
             remainingToDelete -= deleteFromThisLocation;
           }

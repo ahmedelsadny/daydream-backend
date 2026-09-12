@@ -18,8 +18,25 @@ module.exports = (sequelize, DataTypes) => {
         field: 'product_id'
       },
       quantity: {
-        type: DataTypes.INTEGER,
+        type: DataTypes.DECIMAL(10, 3),
         allowNull: false
+      },
+      unitPrice: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false,
+        defaultValue: 0.00,
+        field: 'unit_price'
+      },
+      costPrice: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        field: 'cost_price'
+      },
+      totalPrice: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false,
+        defaultValue: 0.00,
+        field: 'total_price'
       }
     },
     {

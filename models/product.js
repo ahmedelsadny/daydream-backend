@@ -70,6 +70,34 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
         defaultValue: false,
         field: 'is_printed'
+      },
+      unit: {
+        type: DataTypes.STRING,
+        allowNull: false,
+        defaultValue: 'piece',
+        field: 'unit'
+      },
+      isWeighted: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        field: 'is_weighted'
+      },
+      scaleCode: {
+        type: DataTypes.STRING,
+        allowNull: true,
+        field: 'scale_code'
+      },
+      minAlertLimit: {
+        type: DataTypes.DECIMAL(10, 3),
+        allowNull: true,
+        field: 'min_alert_limit'
+      },
+      isFavorite: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        field: 'is_favorite'
       }
     },
     {

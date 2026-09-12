@@ -1,5 +1,5 @@
 const express = require('express');
-const { Shift, User, Branch, Order, OrderItem, Product, Refund, Replacement, sequelize, Sequelize } = require('../models');
+const { Shift, User, Branch, Order, OrderItem, Product, Refund, Replacement, CashTransaction, sequelize, Sequelize } = require('../models');
 const auth = require('../middleware/auth');
 const { allowRoles, ROLES } = require('../middleware/roles');
 const { Op } = require('sequelize');
@@ -29,16 +29,28 @@ router.post('/start', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), asy
         message: 'You already have an active shift. Please end your current shift before starting a new one.',
         activeShift: {
           id: activeShift.id,
-          startTime: activeShift.startTime
+          startTime: activeShift.startTime,
+          openingBalance: parseFloat(activeShift.openingBalance || 0)
         }
       });
     }
 
-    // Create new shift
+    const { openingBalance = 0 } = req.body;
+    const parsedOpeningBalance = parseFloat(openingBalance);
+    if (isNaN(parsedOpeningBalance) || parsedOpeningBalance < 0) {
+      return res.status(400).json({
+        message: 'openingBalance must be a non-negative number'
+      });
+    }
+
+    // Create new shift with opening float
     const shift = await Shift.create({
       cashierId: req.user.id,
       branchId: req.user.branchId,
       startTime: new Date(),
+      openingBalance: parsedOpeningBalance,
+      cashIn: 0.00,
+      cashOut: 0.00,
       status: 'active'
     });
 
@@ -65,6 +77,7 @@ router.post('/start', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), asy
           location: branch.location
         },
         startTime: shift.startTime,
+        openingBalance: parseFloat(shift.openingBalance),
         status: shift.status
       }
     });
@@ -78,11 +91,195 @@ router.post('/start', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), asy
   }
 });
 
+// Deposit cash / additional float into drawer (cashier, branch_manager)
+router.post('/cash-in', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async (req, res) => {
+  const transaction = await sequelize.transaction();
+  try {
+    const activeShift = await Shift.findOne({
+      where: {
+        cashierId: req.user.id,
+        status: 'active'
+      },
+      transaction
+    });
+
+    if (!activeShift) {
+      await transaction.rollback();
+      return res.status(400).json({
+        message: 'No active shift found. Please start a shift first.'
+      });
+    }
+
+    const { amount, reason, notes } = req.body;
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        message: 'amount must be a positive number greater than 0'
+      });
+    }
+
+    if (!reason || !reason.trim()) {
+      await transaction.rollback();
+      return res.status(400).json({
+        message: 'reason is required for cash-in transaction (e.g. Additional Float)'
+      });
+    }
+
+    // Create CashTransaction record
+    const cashTx = await CashTransaction.create({
+      shiftId: activeShift.id,
+      cashierId: req.user.id,
+      branchId: req.user.branchId,
+      type: 'in',
+      amount: parsedAmount,
+      reason: reason.trim(),
+      notes: notes || null
+    }, { transaction });
+
+    // Update shift cash_in total
+    const updatedCashIn = (parseFloat(activeShift.cashIn) || 0) + parsedAmount;
+    await activeShift.update({ cashIn: updatedCashIn }, { transaction });
+
+    await transaction.commit();
+
+    return res.status(201).json({
+      message: 'Cash-in recorded successfully',
+      transaction: cashTx,
+      shiftCashInTotal: updatedCashIn
+    });
+  } catch (error) {
+    await transaction.rollback();
+    console.error('Error recording cash-in:', error);
+    return res.status(500).json({
+      message: 'Internal server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Withdraw cash from drawer (cashier, branch_manager)
+router.post('/cash-out', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async (req, res) => {
+  const transaction = await sequelize.transaction();
+  try {
+    const activeShift = await Shift.findOne({
+      where: {
+        cashierId: req.user.id,
+        status: 'active'
+      },
+      transaction
+    });
+
+    if (!activeShift) {
+      await transaction.rollback();
+      return res.status(400).json({
+        message: 'No active shift found. Please start a shift first.'
+      });
+    }
+
+    const { amount, reason, notes } = req.body;
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        message: 'amount must be a positive number greater than 0'
+      });
+    }
+
+    if (!reason || !reason.trim()) {
+      await transaction.rollback();
+      return res.status(400).json({
+        message: 'reason is required for cash-out transaction (e.g. Petty Cash, Supervisor Drop)'
+      });
+    }
+
+    // Create CashTransaction record
+    const cashTx = await CashTransaction.create({
+      shiftId: activeShift.id,
+      cashierId: req.user.id,
+      branchId: req.user.branchId,
+      type: 'out',
+      amount: parsedAmount,
+      reason: reason.trim(),
+      notes: notes || null
+    }, { transaction });
+
+    // Update shift cash_out total
+    const updatedCashOut = (parseFloat(activeShift.cashOut) || 0) + parsedAmount;
+    await activeShift.update({ cashOut: updatedCashOut }, { transaction });
+
+    await transaction.commit();
+
+    return res.status(201).json({
+      message: 'Cash-out recorded successfully',
+      transaction: cashTx,
+      shiftCashOutTotal: updatedCashOut
+    });
+  } catch (error) {
+    await transaction.rollback();
+    console.error('Error recording cash-out:', error);
+    return res.status(500).json({
+      message: 'Internal server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Get cash transactions for current shift (cashier, branch_manager, admin)
+router.get('/cash-transactions', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER, ROLES.ADMIN), async (req, res) => {
+  try {
+    let shiftId = req.query.shiftId;
+    if (!shiftId) {
+      const activeShift = await Shift.findOne({
+        where: {
+          cashierId: req.user.id,
+          status: 'active'
+        }
+      });
+      if (activeShift) {
+        shiftId = activeShift.id;
+      }
+    }
+
+    if (!shiftId) {
+      return res.status(400).json({ message: 'No active shift found or shiftId query parameter missing' });
+    }
+
+    const transactions = await CashTransaction.findAll({
+      where: { shiftId },
+      include: [
+        { model: User, as: 'cashier', attributes: ['id', 'name', 'email'] }
+      ],
+      order: [['createdAt', 'DESC']]
+    });
+
+    const totalIn = transactions.filter(t => t.type === 'in').reduce((sum, t) => sum + parseFloat(t.amount || 0), 0);
+    const totalOut = transactions.filter(t => t.type === 'out').reduce((sum, t) => sum + parseFloat(t.amount || 0), 0);
+
+    return res.json({
+      shiftId,
+      totalIn,
+      totalOut,
+      netCashMovement: totalIn - totalOut,
+      count: transactions.length,
+      transactions
+    });
+  } catch (error) {
+    console.error('Error fetching cash transactions:', error);
+    return res.status(500).json({
+      message: 'Internal server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
 // End current shift (cashier, branch_manager)
 router.post('/end', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async (req, res) => {
   const transaction = await sequelize.transaction();
 
   try {
+    const { closingBalance, notes } = req.body || {};
+
     // Find active shift for this cashier
     const shift = await Shift.findOne({
       where: {
@@ -98,6 +295,14 @@ router.post('/end', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async
         message: 'No active shift found. Please start a shift first.'
       });
     }
+
+    // Get cash transactions recorded during this shift
+    const cashTransactions = await CashTransaction.findAll({
+      where: { shiftId: shift.id },
+      transaction
+    });
+    const totalCashIn = cashTransactions.filter(t => t.type === 'in').reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
+    const totalCashOut = cashTransactions.filter(t => t.type === 'out').reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
 
     // Calculate shift statistics
     const orders = await Order.findAll({
@@ -198,21 +403,25 @@ router.post('/end', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async
       totalDiscounts += orderDiscount;
       totalSales += parseFloat(order.totalPrice);
       
-      // Calculate cash and visa sales
-      if (order.cashAmount) {
-        cashSales += parseFloat(order.cashAmount);
-      }
-      if (order.visaAmount) {
-        visaSales += parseFloat(order.visaAmount);
+      // Calculate cash and visa sales accurately
+      if (order.paymentMethod === 'cash') {
+        cashSales += parseFloat(order.totalPrice);
+      } else if (order.paymentMethod === 'visa') {
+        visaSales += parseFloat(order.totalPrice);
+      } else if (order.paymentMethod === 'mixed') {
+        const vAmt = parseFloat(order.visaAmount || 0);
+        visaSales += vAmt;
+        const cAmt = parseFloat(order.totalPrice) - vAmt;
+        cashSales += Math.max(0, cAmt);
       }
 
-      // Aggregate products sold
+      // Aggregate products sold with frozen unitPrice
       order.OrderItems.forEach(item => {
         const productId = item.productId;
-        const productName = item.Product.name;
-        const sku = item.Product.sku;
-        const quantity = item.quantity;
-        const unitPrice = parseFloat(item.Product.price);
+        const productName = item.Product ? item.Product.name : 'Unknown Product';
+        const sku = item.Product ? item.Product.sku : 'N/A';
+        const quantity = parseFloat(item.quantity);
+        const unitPrice = item.unitPrice ? parseFloat(item.unitPrice) : (item.Product ? parseFloat(item.Product.price) : 0);
         const itemTotal = unitPrice * quantity;
 
         if (productsSoldMap.has(productId)) {
@@ -235,7 +444,6 @@ router.post('/end', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async
     // Calculate refund totals and aggregate refunded products
     const productsRefundedMap = new Map();
     refunds.forEach(refund => {
-      // Track refund subtotal and discounts
       const refundSubtotalAmount = parseFloat(refund.originalAmount || refund.refundAmount);
       const refundDiscountAmount = parseFloat(refund.discountAmount || 0);
       
@@ -243,12 +451,11 @@ router.post('/end', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async
       refundDiscounts += refundDiscountAmount;
       totalRefunds += parseFloat(refund.refundAmount);
       
-      // Aggregate refunded products
       if (refund.OrderItem && refund.OrderItem.Product) {
         const productId = refund.OrderItem.productId;
         const productName = refund.OrderItem.Product.name;
         const sku = refund.OrderItem.Product.sku;
-        const quantity = refund.quantity;
+        const quantity = parseFloat(refund.quantity);
         const refundAmount = parseFloat(refund.refundAmount);
 
         if (productsRefundedMap.has(productId)) {
@@ -270,7 +477,6 @@ router.post('/end', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async
     // Calculate replacement totals and aggregate replaced products
     const productsReplacedMap = new Map();
     replacements.forEach(replacement => {
-      // Track replacement subtotal and discounts
       const replacementSubtotalAmount = parseFloat(replacement.originalAmount || (parseFloat(replacement.returnedAmount) + parseFloat(replacement.newItemsAmount)));
       const replacementDiscountAmount = parseFloat(replacement.discountAmount || 0);
       
@@ -280,7 +486,6 @@ router.post('/end', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async
       totalReplacementRefunds += parseFloat(replacement.refundToCustomer);
       totalReplacementPayments += parseFloat(replacement.customerPayment);
       
-      // Aggregate replaced products
       if (replacement.originalOrderItem && replacement.originalOrderItem.Product) {
         const productId = replacement.originalOrderItem.productId;
         const productName = replacement.originalOrderItem.Product.name;
@@ -312,10 +517,27 @@ router.post('/end', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async
     const productsReplaced = Array.from(productsReplacedMap.values());
     const netSales = totalSales - totalRefunds;
 
-    // Update shift with end time and statistics
+    // Cash drawer reconciliation calculations
+    const openingBal = parseFloat(shift.openingBalance || 0);
+    const expectedCash = openingBal + (cashSales - totalRefunds) + totalCashIn - totalCashOut;
+    const actualClosing = (closingBalance !== undefined && closingBalance !== null && closingBalance !== '')
+      ? parseFloat(closingBalance)
+      : null;
+    const cashDifference = actualClosing !== null
+      ? parseFloat((actualClosing - expectedCash).toFixed(2))
+      : 0.00;
+
+    // Update shift with end time, statistics, and cash drawer balance
     await shift.update({
       endTime: new Date(),
       status: 'completed',
+      openingBalance: openingBal,
+      closingBalance: actualClosing,
+      expectedBalance: parseFloat(expectedCash.toFixed(2)),
+      cashDifference: cashDifference,
+      cashIn: totalCashIn,
+      cashOut: totalCashOut,
+      notes: notes || shift.notes,
       totalSales: totalSales,
       totalSubtotal: totalSubtotal,
       totalDiscounts: totalDiscounts,
@@ -348,10 +570,12 @@ router.post('/end', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async
       attributes: ['id', 'name', 'location']
     });
 
+    const differenceStatus = cashDifference > 0 ? 'surplus' : (cashDifference < 0 ? 'shortage' : 'balanced');
+
     return res.json({
       message: 'Shift ended successfully',
-      shift: {
-        id: shift.id,
+      zReport: {
+        shiftId: shift.id,
         cashier: {
           id: user.id,
           name: user.name,
@@ -362,25 +586,52 @@ router.post('/end', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async
           name: branch.name,
           location: branch.location
         },
+        timing: {
+          startTime: shift.startTime,
+          endTime: shift.endTime,
+          durationHours: ((new Date(shift.endTime) - new Date(shift.startTime)) / (1000 * 60 * 60)).toFixed(2)
+        },
+        drawerReconciliation: {
+          openingBalance: openingBal,
+          cashSales: parseFloat(cashSales.toFixed(2)),
+          cashRefunds: parseFloat(totalRefunds.toFixed(2)),
+          cashIn: totalCashIn,
+          cashOut: totalCashOut,
+          expectedCash: parseFloat(expectedCash.toFixed(2)),
+          actualCashCounted: actualClosing,
+          difference: cashDifference,
+          status: differenceStatus
+        },
+        salesSummary: {
+          totalOrders: orders.length,
+          totalSubtotal: parseFloat(totalSubtotal.toFixed(2)),
+          totalDiscounts: parseFloat(totalDiscounts.toFixed(2)),
+          totalSales: parseFloat(totalSales.toFixed(2)),
+          cashSales: parseFloat(cashSales.toFixed(2)),
+          visaSales: parseFloat(visaSales.toFixed(2)),
+          netSales: parseFloat(netSales.toFixed(2))
+        },
+        refundsSummary: {
+          count: refunds.length,
+          totalAmount: parseFloat(totalRefunds.toFixed(2))
+        },
+        cashTransactionsCount: cashTransactions.length,
+        notes: shift.notes
+      },
+      shift: {
+        id: shift.id,
         startTime: shift.startTime,
         endTime: shift.endTime,
         status: shift.status,
-        totalSubtotal: parseFloat(shift.totalSubtotal || 0),
-        totalDiscounts: parseFloat(shift.totalDiscounts || 0),
+        openingBalance: openingBal,
+        closingBalance: actualClosing,
+        expectedBalance: parseFloat(expectedCash.toFixed(2)),
+        cashDifference: cashDifference,
+        cashIn: totalCashIn,
+        cashOut: totalCashOut,
         totalSales: parseFloat(shift.totalSales),
-        totalOrders: shift.totalOrders,
-        cashSales: parseFloat(shift.cashSales),
-        visaSales: parseFloat(shift.visaSales),
-        totalRefunds: parseFloat(shift.totalRefunds),
-        refundCount: shift.refundCount,
-        totalReplacements: parseFloat(shift.totalReplacements),
-        replacementCount: shift.replacementCount,
-        totalReplacementRefunds: parseFloat(shift.totalReplacementRefunds),
-        totalReplacementPayments: parseFloat(shift.totalReplacementPayments),
         netSales: parseFloat(shift.netSales),
-        productsSold: shift.productsSold,
-        productsRefunded: shift.productsRefunded,
-        productsReplaced: shift.productsReplaced
+        productsSold: shift.productsSold
       }
     });
 
@@ -487,6 +738,13 @@ router.get('/current', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), as
       ]
     });
 
+    // Get cash transactions recorded during current shift
+    const cashTransactions = await CashTransaction.findAll({
+      where: { shiftId: shift.id }
+    });
+    const currentCashIn = cashTransactions.filter(t => t.type === 'in').reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
+    const currentCashOut = cashTransactions.filter(t => t.type === 'out').reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
+
     let currentTotalSales = 0;
     let currentCashSales = 0;
     let currentVisaSales = 0;
@@ -497,11 +755,15 @@ router.get('/current', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), as
 
     orders.forEach(order => {
       currentTotalSales += parseFloat(order.totalPrice);
-      if (order.cashAmount) {
-        currentCashSales += parseFloat(order.cashAmount);
-      }
-      if (order.visaAmount) {
-        currentVisaSales += parseFloat(order.visaAmount);
+      if (order.paymentMethod === 'cash') {
+        currentCashSales += parseFloat(order.totalPrice);
+      } else if (order.paymentMethod === 'visa') {
+        currentVisaSales += parseFloat(order.totalPrice);
+      } else if (order.paymentMethod === 'mixed') {
+        const vAmt = parseFloat(order.visaAmount || 0);
+        currentVisaSales += vAmt;
+        const cAmt = parseFloat(order.totalPrice) - vAmt;
+        currentCashSales += Math.max(0, cAmt);
       }
     });
 
@@ -515,7 +777,7 @@ router.get('/current', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), as
         const productId = refund.OrderItem.productId;
         const productName = refund.OrderItem.Product.name;
         const sku = refund.OrderItem.Product.sku;
-        const quantity = refund.quantity;
+        const quantity = parseFloat(refund.quantity);
         const refundAmount = parseFloat(refund.refundAmount);
 
         if (currentProductsRefundedMap.has(productId)) {
@@ -580,6 +842,9 @@ router.get('/current', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), as
       }
     });
 
+    const openingBal = parseFloat(shift.openingBalance || 0);
+    const currentDrawerCash = openingBal + (currentCashSales - currentTotalRefunds) + currentCashIn - currentCashOut;
+
     return res.json({
       success: true,
       data: {
@@ -596,6 +861,14 @@ router.get('/current', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), as
         },
         startTime: shift.startTime,
         status: shift.status,
+        drawerSummary: {
+          openingBalance: openingBal,
+          currentCashSales: parseFloat(currentCashSales.toFixed(2)),
+          currentCashRefunds: parseFloat(currentTotalRefunds.toFixed(2)),
+          currentCashIn: parseFloat(currentCashIn.toFixed(2)),
+          currentCashOut: parseFloat(currentCashOut.toFixed(2)),
+          currentDrawerCash: parseFloat(currentDrawerCash.toFixed(2))
+        },
         currentTotalSubtotal: parseFloat(currentTotalSales + currentTotalRefunds) || 0,
         currentTotalDiscounts: parseFloat(totalDiscounts) || 0,
         currentTotalSales: parseFloat(currentTotalSales) || 0,
