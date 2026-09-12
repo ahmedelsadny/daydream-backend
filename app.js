@@ -69,6 +69,10 @@ apiRouter.use('/purchases', require('./controllers/purchases.controller'));
 apiRouter.use('/stocktakes', require('./controllers/stocktakes.controller'));
 // Damaged Items routes
 apiRouter.use('/damaged-items', require('./controllers/damagedItems.controller'));
+// Promotions & Offers routes
+apiRouter.use('/promotions', require('./controllers/promotions.controller'));
+// Products Bulk Excel/CSV Import & Export routes
+apiRouter.use('/products/bulk', require('./controllers/bulkProducts.controller'));
 
 // Mount API v1 router
 app.use('/api/v1', apiRouter);

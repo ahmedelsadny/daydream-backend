@@ -106,6 +106,25 @@ async function ensureSupermarketSchema(sequelize) {
     if (sequelize.models.ProductUnit) {
       await sequelize.models.ProductUnit.sync();
     }
+
+    // Phase 5: Customer credit & debt columns
+    await safeAdd('customers', 'address', '`address` VARCHAR(255)');
+    await safeAdd('customers', 'credit_limit', '`credit_limit` DECIMAL(10, 2) NOT NULL DEFAULT 0.00');
+    await safeAdd('customers', 'current_debt', '`current_debt` DECIMAL(10, 2) NOT NULL DEFAULT 0.00');
+    await safeAdd('customers', 'is_credit_allowed', '`is_credit_allowed` TINYINT(1) NOT NULL DEFAULT 0');
+    await safeAdd('customers', 'notes', '`notes` TEXT');
+
+    // Phase 5: Order credit and promotion discount columns
+    await safeAdd('orders', 'credit_amount', '`credit_amount` DECIMAL(10, 2) DEFAULT 0.00');
+    await safeAdd('orders', 'promotion_discount', '`promotion_discount` DECIMAL(10, 2) DEFAULT 0.00');
+
+    // Phase 5: Create Promotion and CustomerCreditTransaction tables
+    if (sequelize.models.Promotion) {
+      await sequelize.models.Promotion.sync();
+    }
+    if (sequelize.models.CustomerCreditTransaction) {
+      await sequelize.models.CustomerCreditTransaction.sync();
+    }
   } catch (err) {
     console.log('⚠️ [Bootstrap] Schema upgrade warning:', err.message);
   }

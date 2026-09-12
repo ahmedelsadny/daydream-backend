@@ -64,6 +64,8 @@ const {
   StocktakeItem,
   DamagedItem,
   ProductUnit,
+  Promotion,
+  CustomerCreditTransaction,
 } = db;
 
 if (User) {
@@ -441,6 +443,36 @@ if (DamagedItem && User) {
 if (Product && ProductUnit) {
   Product.hasMany(ProductUnit, { as: "units", foreignKey: "productId", onDelete: "CASCADE" });
   ProductUnit.belongsTo(Product, { as: "product", foreignKey: "productId" });
+}
+
+// ==================== Phase 5: Promotions & Customer Credit ====================
+if (Customer && CustomerCreditTransaction) {
+  Customer.hasMany(CustomerCreditTransaction, { as: "creditTransactions", foreignKey: "customerId" });
+  CustomerCreditTransaction.belongsTo(Customer, { as: "customer", foreignKey: "customerId" });
+}
+
+if (CustomerCreditTransaction && Order) {
+  CustomerCreditTransaction.belongsTo(Order, { as: "order", foreignKey: "orderId" });
+}
+
+if (CustomerCreditTransaction && User) {
+  CustomerCreditTransaction.belongsTo(User, { as: "recorder", foreignKey: "recordedBy" });
+}
+
+if (CustomerCreditTransaction && Branch) {
+  CustomerCreditTransaction.belongsTo(Branch, { foreignKey: "branchId" });
+}
+
+if (Promotion && Product) {
+  Promotion.belongsTo(Product, { as: "targetProduct", foreignKey: "targetProductId" });
+}
+
+if (Promotion && Category) {
+  Promotion.belongsTo(Category, { as: "targetCategory", foreignKey: "targetCategoryId" });
+}
+
+if (Promotion && Branch) {
+  Promotion.belongsTo(Branch, { foreignKey: "branchId" });
 }
 
 db.sequelize = sequelize;

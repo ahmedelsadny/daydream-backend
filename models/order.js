@@ -75,7 +75,7 @@ module.exports = (sequelize, DataTypes) => {
         field: 'total_price'
       },
       paymentMethod: {
-        type: DataTypes.ENUM('cash', 'visa', 'mixed'),
+        type: DataTypes.ENUM('cash', 'visa', 'mixed', 'customer_credit'),
         allowNull: false,
         field: 'payment_method'
       },
@@ -88,6 +88,20 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.DECIMAL(10, 2),
         allowNull: true,
         field: 'visa_amount'
+      },
+      creditAmount: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        defaultValue: 0.00,
+        field: 'credit_amount',
+        comment: 'Amount deferred to customer account on tab'
+      },
+      promotionDiscount: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        defaultValue: 0.00,
+        field: 'promotion_discount',
+        comment: 'Total discount granted by promotional rules'
       },
       amountPaid: {
         type: DataTypes.DECIMAL(10, 2),

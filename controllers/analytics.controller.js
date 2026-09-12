@@ -1,8 +1,8 @@
-const express = require('express');
 const { 
   Order, OrderItem, Product, Customer, Branch, User, 
   Shift, Category, SubCategory, Inventory, sequelize, Sequelize,
-  Refund, Replacement, Expense, ExpenseCategory 
+  Refund, Replacement, Expense, ExpenseCategory,
+  Promotion, PurchaseInvoiceItem 
 } = require('../models');
 const auth = require('../middleware/auth');
 const { allowRoles, ROLES } = require('../middleware/roles');
@@ -12,8 +12,8 @@ const router = express.Router();
 
 console.log('🔧 Analytics controller loaded - daily-report route will be available at /api/v1/analytics/daily-report');
 
-// All analytics endpoints are admin-only
-router.use(auth, allowRoles(ROLES.ADMIN));
+// All analytics endpoints are accessible by Admin and Branch Manager
+router.use(auth, allowRoles(ROLES.ADMIN, ROLES.BRANCH_MANAGER));
 
 /**
  * GET /api/v1/analytics/sales-overview
@@ -1810,6 +1810,189 @@ router.get('/net-profit', async (req, res) => {
       message: 'Failed to generate net profit report',
       error: error.message
     });
+  }
+});
+
+// ==================== SUPERMARKET LIVE KPI DASHBOARD ====================
+/**
+ * GET /api/v1/analytics/dashboard
+ * Live Supermarket KPIs: Sales today, Low-stock alerts, Expiry alerts, Top selling products, Customer Debt
+ */
+router.get('/dashboard', async (req, res) => {
+  try {
+    const { branchId: queryBranchId } = req.query;
+    const branchId = req.user.role === ROLES.BRANCH_MANAGER ? req.user.branchId : (queryBranchId || null);
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayEnd = new Date();
+    todayEnd.setHours(23, 59, 59, 999);
+
+    const todayOrderWhere = {
+      status: 'completed',
+      createdAt: { [Op.gte]: todayStart, [Op.lte]: todayEnd }
+    };
+    if (branchId) todayOrderWhere.branchId = branchId;
+
+    // 1. Today's live sales
+    const todayOrders = await Order.findAll({
+      where: todayOrderWhere,
+      attributes: ['id', 'totalPrice', 'paymentMethod', 'cashAmount', 'visaAmount', 'creditAmount', 'promotionDiscount']
+    });
+
+    let todaySales = 0;
+    let cashSales = 0;
+    let visaSales = 0;
+    let creditSales = 0;
+    let totalPromoDiscounts = 0;
+
+    todayOrders.forEach(o => {
+      const tot = parseFloat(o.totalPrice || 0);
+      todaySales += tot;
+      totalPromoDiscounts += parseFloat(o.promotionDiscount || 0);
+
+      if (o.paymentMethod === 'cash') cashSales += tot;
+      else if (o.paymentMethod === 'visa') visaSales += tot;
+      else if (o.paymentMethod === 'customer_credit') creditSales += tot;
+      else if (o.paymentMethod === 'mixed') {
+        const v = parseFloat(o.visaAmount || 0);
+        visaSales += v;
+        cashSales += Math.max(0, tot - v);
+      }
+    });
+
+    // 2. Low-stock alerts (quantity <= minAlertLimit or quantity === 0)
+    const invWhere = {};
+    if (branchId) invWhere.branchId = branchId;
+
+    const lowStockProducts = await Product.findAll({
+      where: {
+        minAlertLimit: { [Op.ne]: null }
+      },
+      include: [
+        {
+          model: Inventory,
+          where: invWhere,
+          required: false
+        },
+        { model: Category, as: 'Category', attributes: ['name'] }
+      ]
+    });
+
+    const stockAlerts = [];
+    lowStockProducts.forEach(p => {
+      const totalAvailable = (p.Inventories || []).reduce((sum, inv) => sum + parseFloat(inv.quantity || 0), 0);
+      const minLimit = parseFloat(p.minAlertLimit || 0);
+      if (totalAvailable <= minLimit) {
+        stockAlerts.push({
+          productId: p.id,
+          name: p.name,
+          sku: p.sku,
+          barcode: p.barcode,
+          category: p.Category ? p.Category.name : null,
+          currentStock: parseFloat(totalAvailable.toFixed(3)),
+          minAlertLimit: minLimit,
+          unit: p.unit || 'piece',
+          status: totalAvailable === 0 ? 'out_of_stock' : 'low_stock'
+        });
+      }
+    });
+
+    // 3. Expiry alerts (next 30 days)
+    const thirtyDaysFromNow = new Date();
+    thirtyDaysFromNow.setDate(thirtyDaysFromNow.getDate() + 30);
+
+    const expiringItems = await PurchaseInvoiceItem.findAll({
+      where: {
+        expiryDate: {
+          [Op.ne]: null,
+          [Op.lte]: thirtyDaysFromNow
+        }
+      },
+      limit: 20,
+      order: [['expiryDate', 'ASC']],
+      include: [
+        { model: Product, as: 'product', attributes: ['id', 'name', 'barcode'] }
+      ]
+    });
+
+    // 4. Top Selling Products (Top 10)
+    const topItems = await OrderItem.findAll({
+      attributes: [
+        'productId',
+        [sequelize.fn('SUM', sequelize.col('quantity')), 'totalQuantitySold'],
+        [sequelize.fn('SUM', sequelize.col('total_price')), 'totalRevenue']
+      ],
+      include: [
+        {
+          model: Order,
+          where: branchId ? { branchId, status: 'completed' } : { status: 'completed' },
+          attributes: []
+        },
+        {
+          model: Product,
+          attributes: ['id', 'name', 'barcode', 'price']
+        }
+      ],
+      group: ['productId', 'Product.id'],
+      order: [[sequelize.literal('totalQuantitySold'), 'DESC']],
+      limit: 10
+    });
+
+    // 5. Total outstanding customer debt
+    const totalDebtSum = await Customer.sum('currentDebt') || 0;
+
+    // 6. Active promotions count
+    const now = new Date();
+    const activePromosCount = await Promotion.count({
+      where: {
+        isActive: true,
+        startDate: { [Op.lte]: now },
+        endDate: { [Op.gte]: now }
+      }
+    });
+
+    return res.json({
+      success: true,
+      timestamp: new Date(),
+      scope: branchId ? `branch:${branchId}` : 'all',
+      todayMetrics: {
+        totalSales: parseFloat(todaySales.toFixed(2)),
+        ordersCount: todayOrders.length,
+        averageBasket: todayOrders.length > 0 ? parseFloat((todaySales / todayOrders.length).toFixed(2)) : 0.00,
+        cashSales: parseFloat(cashSales.toFixed(2)),
+        visaSales: parseFloat(visaSales.toFixed(2)),
+        creditSales: parseFloat(creditSales.toFixed(2)),
+        promotionDiscountsGiven: parseFloat(totalPromoDiscounts.toFixed(2))
+      },
+      alerts: {
+        lowStockCount: stockAlerts.length,
+        stockAlerts: stockAlerts.slice(0, 20),
+        expiringBatchesCount: expiringItems.length,
+        expiringItems: expiringItems.map(item => ({
+          productId: item.productId,
+          productName: item.product?.name,
+          barcode: item.product?.barcode,
+          expiryDate: item.expiryDate,
+          batchNumber: item.batchNumber,
+          daysLeft: Math.ceil((new Date(item.expiryDate) - new Date()) / (1000 * 60 * 60 * 24))
+        }))
+      },
+      topSellingProducts: topItems.map(item => ({
+        productId: item.productId,
+        name: item.Product?.name,
+        barcode: item.Product?.barcode,
+        quantitySold: parseFloat(item.get('totalQuantitySold') || 0),
+        revenue: parseFloat(parseFloat(item.get('totalRevenue') || 0).toFixed(2))
+      })),
+      finances: {
+        outstandingCustomerDebt: parseFloat(parseFloat(totalDebtSum).toFixed(2)),
+        activePromotionsCount: activePromosCount
+      }
+    });
+  } catch (error) {
+    console.error('Error generating supermarket dashboard:', error);
+    return res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 

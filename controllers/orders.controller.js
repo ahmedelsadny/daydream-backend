@@ -1,9 +1,10 @@
 const express = require('express');
-const { Order, OrderItem, Product, Customer, Inventory, ProductSerial, Branch, User, CashierDiscount, HeldOrder, ProductUnit, sequelize, Sequelize } = require('../models');
+const { Order, OrderItem, Product, Customer, Inventory, ProductSerial, Branch, User, CashierDiscount, HeldOrder, ProductUnit, CustomerCreditTransaction, sequelize, Sequelize } = require('../models');
 const auth = require('../middleware/auth');
 const { allowRoles, ROLES } = require('../middleware/roles');
 const { requireSupervisorPin } = require('../middleware/supervisorPin');
 const { logAuditEvent } = require('../utils/auditLogger');
+const { evaluatePromotions } = require('../services/promotionEngine');
 const { Op } = require('sequelize');
 
 const router = express.Router();
@@ -29,9 +30,9 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
     }
 
     // Validate required fields
-    if (!paymentMethod || !['cash', 'visa', 'mixed'].includes(paymentMethod)) {
+    if (!paymentMethod || !['cash', 'visa', 'mixed', 'customer_credit'].includes(paymentMethod)) {
       await transaction.rollback();
-      return res.status(400).json({ message: 'paymentMethod must be cash, visa, or mixed' });
+      return res.status(400).json({ message: 'paymentMethod must be cash, visa, mixed, or customer_credit' });
     }
     if (!items || !Array.isArray(items) || items.length === 0) {
       await transaction.rollback();
@@ -199,8 +200,20 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
       }
     }
 
+    // Automatic Supermarket Promotion Evaluation
+    const { totalPromotionDiscount = 0, appliedPromotions = [] } = await evaluatePromotions({
+      items: validatedItems.map(i => ({
+        productId: i.productId,
+        quantity: i.quantity,
+        unitPrice: i.unitPrice,
+        categoryId: i.product?.categoryId
+      })),
+      branchId: req.user.branchId,
+      subtotal: calculatedTotal
+    });
+
     // Handle discount calculation
-    let subtotal = calculatedTotal;
+    let subtotal = Math.max(0, calculatedTotal - totalPromotionDiscount);
     let discountPercentage = 0;
     let discountAmount = 0;
     let cashierDiscountId = null;
@@ -399,6 +412,27 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
             message: `Total paid (${totalPaid.toFixed(2)}) must equal amountPaid (${actualAmountPaid.toFixed(2)})`
           });
         }
+      } else if (paymentMethod === 'customer_credit') {
+        if (!customer) {
+          await transaction.rollback();
+          return res.status(400).json({ message: 'A registered customer is required for credit / on-account sales' });
+        }
+        if (!customer.isCreditAllowed) {
+          await transaction.rollback();
+          return res.status(400).json({ message: 'Credit / tab sales are not enabled for this customer account' });
+        }
+        const creditLimit = parseFloat(customer.creditLimit || 0);
+        const currentDebt = parseFloat(customer.currentDebt || 0);
+        if (currentDebt + totalPrice > creditLimit) {
+          await transaction.rollback();
+          return res.status(400).json({
+            message: `Customer credit limit exceeded. Current debt: ${currentDebt.toFixed(2)}, Limit: ${creditLimit.toFixed(2)}, Order Total: ${totalPrice.toFixed(2)}`
+          });
+        }
+        actualAmountPaid = 0;
+        changeAmount = 0;
+        finalCashAmount = null;
+        finalVisaAmount = null;
       }
     } else {
       // Legacy logic: exact payment amounts (no change)
@@ -411,6 +445,27 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
       } else if (paymentMethod === 'visa') {
         finalCashAmount = null;
         finalVisaAmount = totalPrice;
+      } else if (paymentMethod === 'customer_credit') {
+        if (!customer) {
+          await transaction.rollback();
+          return res.status(400).json({ message: 'A registered customer is required for credit / on-account sales' });
+        }
+        if (!customer.isCreditAllowed) {
+          await transaction.rollback();
+          return res.status(400).json({ message: 'Credit / tab sales are not enabled for this customer account' });
+        }
+        const creditLimit = parseFloat(customer.creditLimit || 0);
+        const currentDebt = parseFloat(customer.currentDebt || 0);
+        if (currentDebt + totalPrice > creditLimit) {
+          await transaction.rollback();
+          return res.status(400).json({
+            message: `Customer credit limit exceeded. Current debt: ${currentDebt.toFixed(2)}, Limit: ${creditLimit.toFixed(2)}, Order Total: ${totalPrice.toFixed(2)}`
+          });
+        }
+        actualAmountPaid = 0;
+        changeAmount = 0;
+        finalCashAmount = null;
+        finalVisaAmount = null;
       } else if (paymentMethod === 'mixed') {
         if (cashAmount === undefined || cashAmount === null || visaAmount === undefined || visaAmount === null) {
           await transaction.rollback();
@@ -460,6 +515,8 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
       paymentMethod: paymentMethod,
       cashAmount: finalCashAmount,
       visaAmount: finalVisaAmount,
+      creditAmount: paymentMethod === 'customer_credit' ? totalPrice : 0.00,
+      promotionDiscount: totalPromotionDiscount || 0.00,
       amountPaid: actualAmountPaid,
       changeAmount: changeAmount,
       roundingDifference: req.body.roundingDifference ? parseFloat(req.body.roundingDifference) : 0.00,
@@ -534,6 +591,26 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
         loyaltyPoints: (customer.loyaltyPoints || 0) + pointsEarned
       }, { transaction });
       console.log('Backend: Awarded', pointsEarned, 'loyalty points to customer');
+    }
+
+    // Customer Credit transaction and debt update
+    if (paymentMethod === 'customer_credit' && customer) {
+      const prevDebt = parseFloat(customer.currentDebt || 0);
+      const nextDebt = parseFloat((prevDebt + totalPrice).toFixed(2));
+      await customer.update({ currentDebt: nextDebt }, { transaction });
+
+      await CustomerCreditTransaction.create({
+        customerId: customer.id,
+        orderId: order.id,
+        type: 'debit',
+        amount: totalPrice,
+        previousDebt: prevDebt,
+        newDebt: nextDebt,
+        paymentMethod: 'other',
+        notes: `شراء بالآجل فاتورة #${order.id.substring(0, 8).toUpperCase()}`,
+        recordedBy: req.user.id,
+        branchId: req.user.branchId
+      }, { transaction });
     }
 
     await transaction.commit();
