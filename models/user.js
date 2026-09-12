@@ -35,6 +35,12 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.UUID,
         allowNull: true,
         field: 'warehouse_id'
+      },
+      supervisorPin: {
+        type: DataTypes.STRING,
+        allowNull: true,
+        field: 'supervisor_pin',
+        comment: 'Hashed PIN for supervisor approvals (admin, branch_manager)'
       }
     },
     {

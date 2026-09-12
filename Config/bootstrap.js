@@ -66,6 +66,20 @@ async function ensureSupermarketSchema(sequelize) {
     if (sequelize.models.HeldOrder) {
       await sequelize.models.HeldOrder.sync();
     }
+
+    // Phase 3: Supervisor PIN on users
+    await safeAdd('users', 'supervisor_pin', '`supervisor_pin` VARCHAR(255)');
+
+    // Phase 3: Create Expense & Audit tables if not present
+    if (sequelize.models.ExpenseCategory) {
+      await sequelize.models.ExpenseCategory.sync();
+    }
+    if (sequelize.models.Expense) {
+      await sequelize.models.Expense.sync();
+    }
+    if (sequelize.models.AuditLog) {
+      await sequelize.models.AuditLog.sync();
+    }
   } catch (err) {
     console.log('⚠️ [Bootstrap] Schema upgrade warning:', err.message);
   }

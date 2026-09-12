@@ -474,4 +474,98 @@ router.delete('/users/:id', auth, allowRoles(ROLES.ADMIN), async (req, res) => {
   }
 });
 
+// Verify supervisor PIN (cashier, branch_manager, admin)
+router.post('/verify-supervisor-pin', auth, async (req, res) => {
+  try {
+    const { pin } = req.body;
+    if (!pin) {
+      return res.status(400).json({ message: 'pin is required' });
+    }
+
+    const { Op } = require('sequelize');
+    const query = {
+      role: { [Op.in]: [ROLES.ADMIN, ROLES.BRANCH_MANAGER] },
+      supervisorPin: { [Op.ne]: null }
+    };
+
+    if (req.user?.branchId) {
+      query[Op.or] = [
+        { role: ROLES.ADMIN },
+        { role: ROLES.BRANCH_MANAGER, branchId: req.user.branchId }
+      ];
+    }
+
+    const supervisors = await User.findAll({ where: query });
+    let verifiedSupervisor = null;
+
+    for (const sup of supervisors) {
+      if (sup.supervisorPin) {
+        const isMatch = await bcrypt.compare(String(pin), sup.supervisorPin);
+        if (isMatch) {
+          verifiedSupervisor = sup;
+          break;
+        }
+      }
+    }
+
+    if (!verifiedSupervisor) {
+      return res.status(403).json({
+        valid: false,
+        message: 'Invalid supervisor PIN'
+      });
+    }
+
+    return res.json({
+      valid: true,
+      supervisor: {
+        id: verifiedSupervisor.id,
+        name: verifiedSupervisor.name,
+        email: verifiedSupervisor.email,
+        role: verifiedSupervisor.role
+      }
+    });
+  } catch (error) {
+    console.error('Error verifying supervisor pin:', error);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Set or update supervisor PIN (admin, or branch_manager for self)
+router.put('/users/:id/supervisor-pin', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { pin } = req.body;
+
+    if (!pin || String(pin).trim().length < 4) {
+      return res.status(400).json({ message: 'pin is required and must be at least 4 digits' });
+    }
+
+    const targetUser = await User.findByPk(id);
+    if (!targetUser) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Only admin or user updating their own PIN can set it
+    if (req.user.role !== ROLES.ADMIN && req.user.id !== targetUser.id) {
+      return res.status(403).json({ message: 'Forbidden: you cannot set supervisor PIN for another user' });
+    }
+
+    // Only admin or branch_manager can have a supervisor PIN
+    if (targetUser.role !== ROLES.ADMIN && targetUser.role !== ROLES.BRANCH_MANAGER) {
+      return res.status(400).json({ message: 'Supervisor PIN can only be assigned to Admin or Branch Manager accounts' });
+    }
+
+    const pinHash = await bcrypt.hash(String(pin).trim(), 10);
+    await targetUser.update({ supervisorPin: pinHash });
+
+    return res.json({
+      message: 'Supervisor PIN updated successfully',
+      userId: targetUser.id
+    });
+  } catch (error) {
+    console.error('Error setting supervisor pin:', error);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 module.exports = router;

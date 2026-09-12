@@ -2,6 +2,8 @@ const express = require('express');
 const { Order, OrderItem, Product, Customer, Inventory, ProductSerial, Branch, User, CashierDiscount, HeldOrder, sequelize, Sequelize } = require('../models');
 const auth = require('../middleware/auth');
 const { allowRoles, ROLES } = require('../middleware/roles');
+const { requireSupervisorPin } = require('../middleware/supervisorPin');
+const { logAuditEvent } = require('../utils/auditLogger');
 const { Op } = require('sequelize');
 
 const router = express.Router();
@@ -1147,6 +1149,183 @@ router.delete('/held/:id', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER,
       message: 'Internal server error',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
+  }
+});
+
+// ==================== VOID PROTECTION ENDPOINTS ====================
+
+// Void entire order (requires supervisor PIN, restores inventory and reverses loyalty points)
+router.post('/:id/void', auth, allowRoles(ROLES.ADMIN, ROLES.BRANCH_MANAGER, ROLES.CASHIER), requireSupervisorPin, async (req, res) => {
+  const transaction = await sequelize.transaction();
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    if (!reason || !reason.trim()) {
+      await transaction.rollback();
+      return res.status(400).json({ message: 'reason is required for voiding an order' });
+    }
+
+    const orderWhere = { id };
+    if (req.user.role !== ROLES.ADMIN && req.user.branchId) {
+      orderWhere.branchId = req.user.branchId;
+    }
+
+    const order = await Order.findOne({
+      where: orderWhere,
+      include: [
+        { model: OrderItem, as: 'OrderItems' }
+      ],
+      transaction
+    });
+
+    if (!order) {
+      await transaction.rollback();
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    if (order.status === 'cancelled') {
+      await transaction.rollback();
+      return res.status(400).json({ message: 'Order is already cancelled/voided' });
+    }
+
+    if (order.status === 'refunded') {
+      await transaction.rollback();
+      return res.status(400).json({ message: 'Cannot void an order that has already been refunded' });
+    }
+
+    // Restore inventory for all items in order
+    if (order.OrderItems && order.OrderItems.length > 0) {
+      for (const item of order.OrderItems) {
+        const inventory = await Inventory.findOne({
+          where: {
+            productId: item.productId,
+            branchId: order.branchId
+          },
+          transaction
+        });
+
+        if (inventory) {
+          const currentQty = parseFloat(inventory.quantity) || 0;
+          await inventory.update({
+            quantity: currentQty + parseFloat(item.quantity)
+          }, { transaction });
+        } else {
+          await Inventory.create({
+            productId: item.productId,
+            branchId: order.branchId,
+            quantity: parseFloat(item.quantity)
+          }, { transaction });
+        }
+
+        // Unassign serials if item was serial-tracked
+        await ProductSerial.update(
+          { orderItemId: null, note: `voided - order ${order.id}` },
+          { where: { orderItemId: item.id }, transaction }
+        );
+      }
+    }
+
+    // Reversal of loyalty points
+    if (order.customerId) {
+      const customer = await Customer.findByPk(order.customerId, { transaction });
+      if (customer) {
+        const pointsAwarded = Math.floor(parseFloat(order.totalPrice));
+        const newPoints = Math.max(0, (customer.loyaltyPoints || 0) - pointsAwarded);
+        await customer.update({ loyaltyPoints: newPoints }, { transaction });
+      }
+    }
+
+    const oldStatus = order.status;
+
+    await order.update({
+      status: 'cancelled',
+      orderNotes: order.orderNotes ? `${order.orderNotes} | VOIDED: ${reason.trim()}` : `VOIDED: ${reason.trim()}`
+    }, { transaction });
+
+    // Record in Audit Log
+    await logAuditEvent({
+      req,
+      action: 'ORDER_VOID',
+      entityType: 'Order',
+      entityId: order.id,
+      reason: reason.trim(),
+      supervisorId: req.supervisor?.id,
+      oldValues: {
+        status: oldStatus,
+        totalPrice: order.totalPrice,
+        itemsCount: order.OrderItems ? order.OrderItems.length : 0
+      },
+      newValues: {
+        status: 'cancelled',
+        voidedBySupervisor: req.supervisor?.name
+      },
+      transaction
+    });
+
+    await transaction.commit();
+
+    return res.json({
+      message: 'Order voided successfully and inventory restored to branch',
+      orderId: order.id,
+      authorizedBy: req.supervisor ? { id: req.supervisor.id, name: req.supervisor.name } : null
+    });
+
+  } catch (error) {
+    await transaction.rollback();
+    console.error('Error voiding order:', error);
+    return res.status(500).json({
+      message: 'Internal server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Void item at POS checkout (requires supervisor PIN to track item deletions)
+router.post('/void-item', auth, allowRoles(ROLES.ADMIN, ROLES.BRANCH_MANAGER, ROLES.CASHIER), requireSupervisorPin, async (req, res) => {
+  try {
+    const { productId, productName, quantity, unitPrice, reason, cartSessionId } = req.body;
+
+    if (!productId) {
+      return res.status(400).json({ message: 'productId is required' });
+    }
+
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ message: 'reason is required for item void' });
+    }
+
+    await logAuditEvent({
+      req,
+      action: 'ITEM_VOID',
+      entityType: 'Product',
+      entityId: productId,
+      reason: reason.trim(),
+      supervisorId: req.supervisor?.id,
+      oldValues: {
+        productName: productName || null,
+        quantity: parseFloat(quantity) || 1,
+        unitPrice: parseFloat(unitPrice) || 0,
+        cartSessionId: cartSessionId || null
+      },
+      newValues: {
+        voided: true,
+        authorizedBy: req.supervisor?.name
+      }
+    });
+
+    return res.json({
+      message: 'Item void authorized and logged successfully',
+      item: {
+        productId,
+        productName,
+        quantity: parseFloat(quantity) || 1,
+        unitPrice: parseFloat(unitPrice) || 0
+      },
+      authorizedBy: req.supervisor ? { id: req.supervisor.id, name: req.supervisor.name } : null
+    });
+  } catch (error) {
+    console.error('Error recording item void:', error);
+    return res.status(500).json({ message: 'Internal server error' });
   }
 });
 

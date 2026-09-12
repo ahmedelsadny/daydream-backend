@@ -57,6 +57,10 @@ apiRouter.use('/shifts', require('./controllers/shifts.controller'));
 apiRouter.use('/receipt-settings', require('./controllers/receiptSettings.controller'));
 // Analytics routes
 apiRouter.use('/analytics', require('./controllers/analytics.controller'));
+// Expenses routes
+apiRouter.use('/expenses', require('./controllers/expenses.controller'));
+// Audit Logs routes
+apiRouter.use('/audit-logs', require('./controllers/auditLogs.controller'));
 
 // Mount API v1 router
 app.use('/api/v1', apiRouter);

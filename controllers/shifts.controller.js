@@ -2,6 +2,7 @@ const express = require('express');
 const { Shift, User, Branch, Order, OrderItem, Product, Refund, Replacement, CashTransaction, sequelize, Sequelize } = require('../models');
 const auth = require('../middleware/auth');
 const { allowRoles, ROLES } = require('../middleware/roles');
+const { logAuditEvent } = require('../utils/auditLogger');
 const { Op } = require('sequelize');
 
 const router = express.Router();
@@ -270,6 +271,40 @@ router.get('/cash-transactions', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MA
       message: 'Internal server error',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
+  }
+});
+
+// Record manual cash drawer opening without sale (cashier, branch_manager)
+router.post('/drawer-open', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async (req, res) => {
+  try {
+    const { reason = 'Manual No-Sale Drawer Kick' } = req.body || {};
+
+    const activeShift = await Shift.findOne({
+      where: {
+        cashierId: req.user.id,
+        status: 'active'
+      }
+    });
+
+    await logAuditEvent({
+      req,
+      action: 'DRAWER_KICK_MANUAL',
+      entityType: 'Shift',
+      entityId: activeShift ? activeShift.id : null,
+      reason: reason,
+      newValues: {
+        drawerTriggeredAt: new Date(),
+        cashierName: req.user.name
+      }
+    });
+
+    return res.json({
+      message: 'Drawer kick event logged successfully in audit trail',
+      timestamp: new Date()
+    });
+  } catch (error) {
+    console.error('Error logging drawer kick:', error);
+    return res.status(500).json({ message: 'Internal server error' });
   }
 });
 
@@ -1125,6 +1160,65 @@ router.get('/:id', auth, allowRoles(ROLES.ADMIN), async (req, res) => {
 
   } catch (error) {
     console.error('Error fetching shift:', error);
+    return res.status(500).json({
+      message: 'Internal server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Register manual cash drawer kick/opening in audit trail
+router.post('/drawer-open', auth, allowRoles(ROLES.ADMIN, ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (req, res) => {
+  try {
+    const { reason, supervisorPin } = req.body;
+    const branchId = req.user.branchId;
+
+    let supervisor = null;
+    if (supervisorPin) {
+      const supervisors = await User.findAll({
+        where: {
+          role: { [Op.in]: [ROLES.ADMIN, ROLES.BRANCH_MANAGER] },
+          supervisorPin: { [Op.ne]: null }
+        }
+      });
+      const bcrypt = require('bcryptjs');
+      for (const sup of supervisors) {
+        if (await bcrypt.compare(String(supervisorPin), sup.supervisorPin)) {
+          supervisor = sup;
+          break;
+        }
+      }
+    }
+
+    const currentShift = await Shift.findOne({
+      where: {
+        cashierId: req.user.id,
+        status: 'active'
+      }
+    });
+
+    await logAuditEvent({
+      req,
+      action: 'DRAWER_KICK',
+      entityType: 'Shift',
+      entityId: currentShift ? currentShift.id : null,
+      branchId,
+      reason: reason ? String(reason).trim() : 'Manual drawer kick by cashier',
+      supervisorId: supervisor ? supervisor.id : null,
+      newValues: {
+        openedAt: new Date(),
+        shiftId: currentShift ? currentShift.id : null,
+        authorizedBySupervisor: supervisor ? supervisor.name : null
+      }
+    });
+
+    return res.json({
+      message: 'Drawer kick recorded in audit trail successfully',
+      shiftId: currentShift ? currentShift.id : null,
+      authorizedBy: supervisor ? { id: supervisor.id, name: supervisor.name } : null
+    });
+  } catch (error) {
+    console.error('Error logging drawer kick:', error);
     return res.status(500).json({
       message: 'Internal server error',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined

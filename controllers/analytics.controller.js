@@ -2,7 +2,7 @@ const express = require('express');
 const { 
   Order, OrderItem, Product, Customer, Branch, User, 
   Shift, Category, SubCategory, Inventory, sequelize, Sequelize,
-  Refund, Replacement 
+  Refund, Replacement, Expense, ExpenseCategory 
 } = require('../models');
 const auth = require('../middleware/auth');
 const { allowRoles, ROLES } = require('../middleware/roles');
@@ -1670,6 +1670,144 @@ router.get('/detailed-report', async (req, res) => {
     return res.status(500).json({
       success: false,
       message: 'Failed to generate detailed report',
+      error: error.message
+    });
+  }
+// ==================== TRUE NET PROFIT REPORT ====================
+/**
+ * GET /api/v1/analytics/net-profit
+ * True Enterprise Net Profit Report:
+ * Net Profit = (Net Sales - COGS) - Total Operating Expenses
+ */
+router.get('/net-profit', async (req, res) => {
+  try {
+    const { startDate, endDate, branchId } = req.query;
+
+    const orderWhere = { status: 'completed' };
+    const refundWhere = { status: 'approved' };
+    const expenseWhere = {};
+
+    if (branchId && branchId !== 'all') {
+      orderWhere.branchId = branchId;
+      refundWhere.branchId = branchId;
+      expenseWhere.branchId = branchId;
+    }
+
+    if (startDate || endDate) {
+      const dateRange = {};
+      if (startDate) dateRange[Op.gte] = new Date(startDate);
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        dateRange[Op.lte] = end;
+      }
+      orderWhere.createdAt = dateRange;
+      refundWhere.createdAt = dateRange;
+      expenseWhere.expenseDate = dateRange;
+    }
+
+    // 1. Sales metrics and OrderItems COGS
+    const orders = await Order.findAll({
+      where: orderWhere,
+      include: [
+        {
+          model: OrderItem,
+          as: 'OrderItems',
+          include: [{ model: Product, attributes: ['id', 'name', 'cost', 'price'] }]
+        }
+      ]
+    });
+
+    let grossSales = 0;
+    let totalDiscounts = 0;
+    let totalSales = 0;
+    let totalCogs = 0;
+
+    orders.forEach(order => {
+      grossSales += parseFloat(order.subtotal || order.totalPrice || 0);
+      totalDiscounts += parseFloat(order.discountAmount || 0);
+      totalSales += parseFloat(order.totalPrice || 0);
+
+      (order.OrderItems || []).forEach(item => {
+        const qty = parseFloat(item.quantity || 0);
+        const cost = item.costPrice ? parseFloat(item.costPrice) : (item.Product?.cost ? parseFloat(item.Product.cost) : 0);
+        totalCogs += cost * qty;
+      });
+    });
+
+    // 2. Refunds
+    const totalRefunds = await Refund.sum('refundAmount', { where: refundWhere }) || 0;
+
+    const netRevenue = totalSales - parseFloat(totalRefunds);
+    const grossProfit = netRevenue - totalCogs;
+    const grossProfitMargin = netRevenue > 0 ? (grossProfit / netRevenue) * 100 : 0;
+
+    // 3. Operating Expenses
+    const expenses = await Expense.findAll({
+      where: expenseWhere,
+      include: [
+        { model: ExpenseCategory, as: 'category', attributes: ['id', 'name'] }
+      ]
+    });
+
+    let totalExpenses = 0;
+    const expensesByCategory = {};
+    expenses.forEach(exp => {
+      const amt = parseFloat(exp.amount || 0);
+      totalExpenses += amt;
+      const catName = exp.category?.name || 'مصروفات أخرى';
+      expensesByCategory[catName] = (expensesByCategory[catName] || 0) + amt;
+    });
+
+    // 4. True Net Profit
+    const trueNetProfit = grossProfit - totalExpenses;
+    const netProfitMargin = netRevenue > 0 ? (trueNetProfit / netRevenue) * 100 : 0;
+
+    return res.json({
+      success: true,
+      period: {
+        startDate: startDate || 'All time',
+        endDate: endDate || 'All time',
+        branchId: branchId || 'all'
+      },
+      incomeStatement: {
+        revenue: {
+          grossSales: parseFloat(grossSales.toFixed(2)),
+          discounts: parseFloat(totalDiscounts.toFixed(2)),
+          totalSales: parseFloat(totalSales.toFixed(2)),
+          refunds: parseFloat(parseFloat(totalRefunds).toFixed(2)),
+          netRevenue: parseFloat(netRevenue.toFixed(2))
+        },
+        costOfGoodsSold: {
+          totalCogs: parseFloat(totalCogs.toFixed(2)),
+          cogsPercentage: netRevenue > 0 ? parseFloat(((totalCogs / netRevenue) * 100).toFixed(2)) : 0
+        },
+        grossProfit: {
+          amount: parseFloat(grossProfit.toFixed(2)),
+          marginPercentage: parseFloat(grossProfitMargin.toFixed(2))
+        },
+        operatingExpenses: {
+          total: parseFloat(totalExpenses.toFixed(2)),
+          percentageOfRevenue: netRevenue > 0 ? parseFloat(((totalExpenses / netRevenue) * 100).toFixed(2)) : 0,
+          breakdownByCategory: Object.keys(expensesByCategory).map(cat => ({
+            category: cat,
+            amount: parseFloat(expensesByCategory[cat].toFixed(2)),
+            percentage: totalExpenses > 0 ? parseFloat(((expensesByCategory[cat] / totalExpenses) * 100).toFixed(2)) : 0
+          }))
+        },
+        netProfit: {
+          amount: parseFloat(trueNetProfit.toFixed(2)),
+          marginPercentage: parseFloat(netProfitMargin.toFixed(2)),
+          status: trueNetProfit >= 0 ? 'profitable' : 'loss'
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Net profit report error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to generate net profit report',
       error: error.message
     });
   }

@@ -53,6 +53,9 @@ const {
   ReceiptSettings,
   CashTransaction,
   HeldOrder,
+  ExpenseCategory,
+  Expense,
+  AuditLog,
 } = db;
 
 if (User) {
@@ -314,6 +317,36 @@ if (HeldOrder && User) {
 if (HeldOrder && Customer) {
   HeldOrder.belongsTo(Customer, { foreignKey: "customerId" });
   Customer.hasMany(HeldOrder, { foreignKey: "customerId" });
+}
+
+if (Expense && ExpenseCategory) {
+  Expense.belongsTo(ExpenseCategory, { as: "category", foreignKey: "categoryId" });
+  ExpenseCategory.hasMany(Expense, { foreignKey: "categoryId" });
+}
+
+if (Expense && Branch) {
+  Expense.belongsTo(Branch, { foreignKey: "branchId" });
+  Branch.hasMany(Expense, { foreignKey: "branchId" });
+}
+
+if (Expense && User) {
+  Expense.belongsTo(User, { as: "recorder", foreignKey: "userId" });
+  User.hasMany(Expense, { foreignKey: "userId" });
+}
+
+if (Expense && Shift) {
+  Expense.belongsTo(Shift, { foreignKey: "shiftId" });
+  Shift.hasMany(Expense, { foreignKey: "shiftId" });
+}
+
+if (AuditLog && User) {
+  AuditLog.belongsTo(User, { as: "user", foreignKey: "userId" });
+  AuditLog.belongsTo(User, { as: "supervisor", foreignKey: "supervisorId" });
+}
+
+if (AuditLog && Branch) {
+  AuditLog.belongsTo(Branch, { foreignKey: "branchId" });
+  Branch.hasMany(AuditLog, { foreignKey: "branchId" });
 }
 
 db.sequelize = sequelize;
