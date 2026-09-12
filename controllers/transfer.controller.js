@@ -11,8 +11,6 @@ router.use(auth);
 
 // Admin and Stock Keeper: Create and execute stock transfer
 router.post('/', allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, res) => {
-  const transaction = await require('../models').sequelize.transaction();
-  
   try {
     const { 
       // Legacy single product fields (for backward compatibility)
@@ -66,6 +64,9 @@ router.post('/', allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, res) =
         message: 'Cannot transfer to the same location' 
       });
     }
+
+    // Start transaction only after input validations pass
+    const transaction = await require('../models').sequelize.transaction();
 
     // Verify locations exist
     let fromLocation, toLocation;
@@ -353,7 +354,13 @@ router.post('/', allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, res) =
     });
 
   } catch (error) {
-    await transaction.rollback();
+    if (typeof transaction !== 'undefined' && transaction && !transaction.finished) {
+      try {
+        await transaction.rollback();
+      } catch (rbError) {
+        console.error('Error rolling back transfer transaction:', rbError);
+      }
+    }
     console.error('Error creating transfer:', error);
     
     // Handle Sequelize validation errors

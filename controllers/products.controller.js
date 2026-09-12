@@ -1,5 +1,5 @@
 const express = require('express');
-const { Product, Category, SubCategory, Inventory, ProductSerial, Warehouse, Order, OrderItem, sequelize, Sequelize } = require('../models');
+const { Product, Category, SubCategory, Inventory, ProductSerial, Warehouse, Branch, Order, OrderItem, Transfer, sequelize, Sequelize } = require('../models');
 const { Op } = Sequelize;
 const auth = require('../middleware/auth');
 const { allowRoles, ROLES } = require('../middleware/roles');
@@ -60,6 +60,24 @@ function getColorAbbr(color) {
   return abbrMap[color.toLowerCase()] || 'CLR';
 }
 
+// Helper function to extract human readable code from serial note safely
+function extractHumanCode(note) {
+  if (!note || typeof note !== 'string') return null;
+  const match = note.split('(')[1];
+  return match ? match.replace(')', '').trim() : null;
+}
+
+// Safe UUID generator with crypto fallback
+function generateBatchId() {
+  try {
+    const { v4: uuidv4 } = require('uuid');
+    return uuidv4();
+  } catch (err) {
+    const crypto = require('crypto');
+    return crypto.randomUUID ? crypto.randomUUID() : ('batch-' + Date.now() + '-' + Math.random().toString(36).substring(2, 9));
+  }
+}
+
 // Create product (admin, stock_keeper)
 router.post('/', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, res) => {
   const { 
@@ -73,15 +91,24 @@ router.post('/', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, 
     shoeSize, 
     color, 
     gender, 
+    // Handle both old single-location format and new multi-location format
     warehouseId, 
-    quantity 
+    quantity,
+    initialInventory // Array of { warehouseId?, branchId?, quantity }
   } = req.body || {};
 
-  // Debug logging
-  console.log('Creating product with data:', {
-    name, price, cost, currency, categoryId, subCategoryId, 
-    size, shoeSize, color, gender, warehouseId, quantity
-  });
+  // Standardize inventory format
+  let inventoryList = initialInventory;
+  if (!inventoryList || !Array.isArray(inventoryList)) {
+    inventoryList = [{
+      warehouseId: warehouseId || null,
+      branchId: null,
+      quantity: quantity || 0
+    }];
+  }
+
+  // Calculate total quantity across all entries
+  const totalQuantity = inventoryList.reduce((sum, item) => sum + (parseInt(item.quantity) || 0), 0);
 
   // Validate required fields
   if (!name || !name.trim()) {
@@ -99,245 +126,160 @@ router.post('/', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, 
   if (!cost || cost <= 0) {
     return res.status(400).json({ message: 'cost is required and must be greater than 0' });
   }
-  // Color is optional, but if provided, it must not be empty
-  if (color !== undefined && color !== null && color !== '' && color.trim() === '') {
-    return res.status(400).json({ message: 'color cannot be empty if provided' });
-  }
   if (!gender || !['Men', 'Women', 'Unisex', 'Kids'].includes(gender)) {
     return res.status(400).json({ message: 'gender is required and must be Men, Women, Unisex, or Kids' });
   }
-  if (!quantity || quantity <= 0) {
-    return res.status(400).json({ message: 'quantity is required and must be greater than 0' });
+  if (totalQuantity <= 0) {
+    return res.status(400).json({ message: 'total quantity must be greater than 0 across all locations' });
   }
   if (!currency || !currency.trim()) {
     return res.status(400).json({ message: 'currency is required' });
   }
 
+  const transaction = await sequelize.transaction();
   try {
     // Verify category and subcategory exist
-    const category = await Category.findByPk(categoryId);
-    const subCategory = await SubCategory.findByPk(subCategoryId);
+    const category = await Category.findByPk(categoryId, { transaction });
+    const subCategory = await SubCategory.findByPk(subCategoryId, { transaction });
     
-    if (!category) {
-      return res.status(404).json({ message: 'Category not found' });
-    }
-    if (!subCategory) {
-      return res.status(404).json({ message: 'SubCategory not found' });
-    }
-
-    // Verify warehouse exists (default to central if not provided)
-    let targetWarehouseId = warehouseId;
-    if (!targetWarehouseId) {
-      const centralWarehouse = await Warehouse.findOne({ where: { type: 'central' } });
-      if (!centralWarehouse) {
-        return res.status(404).json({ message: 'No central warehouse found. Please specify a warehouseId' });
-      }
-      targetWarehouseId = centralWarehouse.id;
-    } else {
-      const warehouse = await Warehouse.findByPk(targetWarehouseId);
-      if (!warehouse) {
-        return res.status(404).json({ message: 'Warehouse not found' });
-      }
+    if (!category || !subCategory) {
+      await transaction.rollback();
+      return res.status(404).json({ message: 'Category or SubCategory not found' });
     }
 
     // Generate SKU
     const categoryAbbr = getCategoryAbbr(category.name);
     const subCategoryAbbr = getSubCategoryAbbr(subCategory.name);
     const colorAbbr = color ? getColorAbbr(color) : 'NOC';
+    let skuPattern = (size || shoeSize) 
+      ? `${categoryAbbr}-${subCategoryAbbr}-${size || shoeSize}-${colorAbbr}`
+      : `${categoryAbbr}-${subCategoryAbbr}-${colorAbbr}`;
     
-    // Generate SKU pattern - include size/shoeSize only if they exist
-    let skuPattern;
-    if (size || shoeSize) {
-      // Include size in SKU if provided
-      skuPattern = `${categoryAbbr}-${subCategoryAbbr}-${size || shoeSize}-${colorAbbr}`;
-    } else {
-      // No size, generate SKU without size component
-      skuPattern = `${categoryAbbr}-${subCategoryAbbr}-${colorAbbr}`;
-    }
-    
-    // Find the highest existing sequence number for this pattern
-    const existingProducts = await Product.findAll({
-      where: {
-        sku: {
-          [require('sequelize').Op.like]: `${skuPattern}-%`
-        }
-      },
-      order: [['createdAt', 'DESC']]
+    // Find the highest existing sequence number for this pattern in a dialect-agnostic way
+    const existingSkuProducts = await Product.findAll({
+      attributes: ['sku'],
+      where: { sku: { [Op.like]: `${skuPattern}-%` } },
+      raw: true,
+      transaction
     });
+    let maxSkuSeq = 0;
+    for (const p of existingSkuProducts) {
+      const parts = p.sku ? p.sku.split('-') : [];
+      const num = parseInt(parts[parts.length - 1], 10);
+      if (!isNaN(num) && num > maxSkuSeq) maxSkuSeq = num;
+    }
+    const nextSeq = String(maxSkuSeq + 1).padStart(3, '0');
+    let sku = `${skuPattern}-${nextSeq}`;
     
-    // Extract sequence numbers and find the highest
-    let maxSeq = 0;
-    existingProducts.forEach(product => {
-      const parts = product.sku.split('-');
-      const seqPart = parts[parts.length - 1];
-      const seqNum = parseInt(seqPart, 10);
-      if (!isNaN(seqNum) && seqNum > maxSeq) {
-        maxSeq = seqNum;
+    // Generate product barcode in a dialect-agnostic way
+    const isSqlite = sequelize.getDialect() === 'sqlite';
+    const barcodeAttr = isSqlite
+      ? sequelize.literal('MAX(CAST(SUBSTR(barcode, 2, 11) AS INTEGER))')
+      : sequelize.literal('MAX(CAST(SUBSTR(barcode, 2, 11) AS UNSIGNED))');
+
+    const barcodeQueryOptions = {
+      attributes: [[barcodeAttr, 'maxSeq']],
+      raw: true,
+      transaction
+    };
+    if (!isSqlite) {
+      barcodeQueryOptions.lock = transaction.LOCK.UPDATE;
+    }
+
+    const [maxProductRow] = await Product.findAll(barcodeQueryOptions);
+    const nextProductSeq = (maxProductRow?.maxSeq || 0) + 1;
+    const productBarcodeBase = `1${String(nextProductSeq).padStart(11, '0')}`;
+    const productBarcode = productBarcodeBase + generateEAN13CheckDigit(productBarcodeBase);
+
+    // Create product
+    const product = await Product.create({
+      name, sku, barcode: productBarcode, price, cost, categoryId, subCategoryId,
+      size: size || null, shoeSize: shoeSize || null, color, gender, currency
+    }, { transaction });
+
+    // Generate batch ID for all serials created in this request
+    const batchId = generateBatchId();
+    
+    // Get initial serial sequence
+    const serialAttr = isSqlite
+      ? sequelize.literal('MAX(CAST(SUBSTR(serial_code, 2, 11) AS INTEGER))')
+      : sequelize.literal('MAX(CAST(SUBSTR(serial_code, 2, 11) AS UNSIGNED))');
+
+    const serialQueryOptions = {
+      attributes: [[serialAttr, 'maxSeq']],
+      raw: true,
+      transaction
+    };
+    if (!isSqlite) {
+      serialQueryOptions.lock = transaction.LOCK.UPDATE;
+    }
+
+    const [maxSerialRow] = await ProductSerial.findAll(serialQueryOptions);
+    let currentSerialSeq = (maxSerialRow?.maxSeq || 0) + 1;
+
+    const createdInventory = [];
+    const createdSerials = [];
+
+    // Process each inventory entry
+    for (const item of inventoryList) {
+      const { warehouseId, branchId, quantity: itemQty } = item;
+      const qty = parseInt(itemQty);
+      if (qty <= 0) continue;
+
+      // Validate location
+      if (warehouseId) {
+        const wh = await Warehouse.findByPk(warehouseId, { transaction });
+        if (!wh) { await transaction.rollback(); return res.status(404).json({ message: `Warehouse ${warehouseId} not found` }); }
+      } else if (branchId) {
+        const br = await require('../models').Branch.findByPk(branchId, { transaction });
+        if (!br) { await transaction.rollback(); return res.status(404).json({ message: `Branch ${branchId} not found` }); }
+      } else {
+        await transaction.rollback();
+        return res.status(400).json({ message: 'Each inventory entry must have a warehouseId or branchId' });
       }
-    });
-    
-    const nextSeq = String(maxSeq + 1).padStart(3, '0');
-    const sku = `${skuPattern}-${nextSeq}`;
-    
-    console.log('Generated SKU:', sku, 'from pattern:', skuPattern, 'maxSeq:', maxSeq, 'hasSize:', !!(size || shoeSize));
 
-    // Generate product barcode (EAN-13 compatible) - starts with 1
-    // Find the highest existing product barcode sequence numerically
-    const [maxProductRow] = await Product.findAll({
-      attributes: [
-        [sequelize.literal('MAX(CAST(SUBSTRING(barcode, 2, 11) AS UNSIGNED))'), 'maxSeq']
-      ],
-      raw: true
-    });
-
-    let nextProductSeq = 1;
-    if (maxProductRow && maxProductRow.maxSeq !== null && maxProductRow.maxSeq !== undefined) {
-      const parsedMax = parseInt(maxProductRow.maxSeq, 10);
-      nextProductSeq = Number.isFinite(parsedMax) ? parsedMax + 1 : 1;
-    }
-
-    const productBarcodeBase = `1${String(nextProductSeq).padStart(11, '0')}`; // 1 + 11 digits
-    const productCheckDigit = generateEAN13CheckDigit(productBarcodeBase);
-    const productBarcode = productBarcodeBase + productCheckDigit;
-
-    console.log('Generated product barcode:', productBarcode, 'sequence:', nextProductSeq);
-
-    // Create product with retry mechanism for SKU conflicts
-    let product;
-    let attempts = 0;
-    const maxAttempts = 3;
-    
-    while (attempts < maxAttempts) {
-      try {
-        product = await Product.create({
-          name,
-          sku,
-          barcode: productBarcode,
-          price,
-          cost,
-          categoryId,
-          subCategoryId,
-          size: size || null,
-          shoeSize: shoeSize || null,
-          color,
-          gender,
-          currency
-        });
-        break; // Success, exit the retry loop
-      } catch (error) {
-        if (error.name === 'SequelizeUniqueConstraintError' && error.fields && error.fields.sku) {
-          attempts++;
-          console.log(`SKU conflict detected, retrying... (attempt ${attempts}/${maxAttempts})`);
-          
-          // Generate a new SKU with timestamp to ensure uniqueness
-          const timestamp = Date.now().toString().slice(-3);
-          sku = `${skuPattern}-${timestamp}`;
-          console.log('New SKU generated:', sku);
-        } else {
-          throw error; // Re-throw if it's not a SKU conflict
-        }
-      }
-    }
-    
-    if (attempts >= maxAttempts) {
-      throw new Error('Failed to generate unique SKU after multiple attempts');
-    }
-
-    // Create inventory record
-    const inventory = await Inventory.create({
-      productId: product.id,
-      warehouseId: targetWarehouseId,
-      branchId: null,
-      quantity
-    });
-
-    // Generate serials for each unit (EAN-13 compatible) - starts with 2
-    const serials = [];
-    
-    // Generate batch ID for this initial creation
-    const { v4: uuidv4 } = require('uuid');
-    const batchId = uuidv4();
-    
-    // Compute the highest existing numeric serial sequence robustly in DB to avoid lexicographic issues
-    const [maxRow] = await ProductSerial.findAll({
-      attributes: [[sequelize.literal('MAX(CAST(SUBSTRING(serial_code, 2, 11) AS UNSIGNED))'), 'maxSeq']],
-      raw: true
-    });
-    let baseSerialSeq = 1;
-    if (maxRow && maxRow.maxSeq !== null && maxRow.maxSeq !== undefined) {
-      const parsedMax = parseInt(maxRow.maxSeq, 10);
-      baseSerialSeq = Number.isFinite(parsedMax) ? parsedMax + 1 : 1;
-    }
-    
-    for (let i = 1; i <= quantity; i++) {
-      // Generate serial barcode (EAN-13) - starts with 2 to avoid confusion
-      const serialSeq = baseSerialSeq + i - 1; // Ensure unique sequence across all products
-      const serialBarcodeBase = `2${String(serialSeq).padStart(11, '0')}`; // 2 + 11 digits
-      const serialCheckDigit = generateEAN13CheckDigit(serialBarcodeBase);
-      const serialBarcode = serialBarcodeBase + serialCheckDigit;
-      
-      // Keep human-readable serial code for reference
-      const humanSerialCode = `${sku}-${String(i).padStart(4, '0')}`;
-      
-      const serial = await ProductSerial.create({
+      // Create inventory record
+      const inventory = await Inventory.create({
         productId: product.id,
-        serialCode: serialBarcode, // Store the scannable barcode
-        note: `in_stock - warehouse ${targetWarehouseId} (${humanSerialCode})`,
-        warehouseId: targetWarehouseId,
-        branchId: null,
-        orderItemId: null,
-        isPrinted: false,
-        batchId: batchId
-      });
-      serials.push(serial);
+        warehouseId: warehouseId || null,
+        branchId: branchId || null,
+        quantity: qty
+      }, { transaction });
+      createdInventory.push(inventory);
+
+      // Create serials for this location
+      for (let i = 0; i < qty; i++) {
+        const serialBarcodeBase = `2${String(currentSerialSeq).padStart(11, '0')}`;
+        const serialBarcode = serialBarcodeBase + generateEAN13CheckDigit(serialBarcodeBase);
+        const humanSerialCode = `${sku}-${String(i + 1).padStart(4, '0')}`;
+        
+        const serial = await ProductSerial.create({
+          productId: product.id,
+          serialCode: serialBarcode,
+          note: `initial_stock - ${warehouseId ? 'warehouse' : 'branch'} ${warehouseId || branchId} (${humanSerialCode})`,
+          warehouseId: warehouseId || null,
+          branchId: branchId || null,
+          batchId: batchId
+        }, { transaction });
+        
+        createdSerials.push(serial);
+        currentSerialSeq++;
+      }
     }
+
+    await transaction.commit();
 
     return res.status(201).json({
-      product: {
-        id: product.id,
-        name: product.name,
-        sku: product.sku,
-        barcode: product.barcode,
-        price: product.price,
-        cost: product.cost,
-        categoryId: product.categoryId,
-        subCategoryId: product.subCategoryId,
-        size: product.size,
-        shoeSize: product.shoeSize,
-        color: product.color,
-        gender: product.gender,
-        isPrinted: product.isPrinted,
-        currency: product.currency,
-        createdAt: product.createdAt,
-        updatedAt: product.updatedAt
-      },
-      inventory: {
-        id: inventory.id,
-        productId: inventory.productId,
-        warehouseId: inventory.warehouseId,
-        quantity: inventory.quantity
-      },
-      serials: serials.map(s => ({
-        id: s.id,
-        serialCode: s.serialCode, // EAN-13 scannable barcode
-        humanCode: s.note.split('(')[1]?.replace(')', ''), // Human-readable code
-        note: s.note,
-        warehouseId: s.warehouseId
-      })),
-      message: `Product created successfully with ${quantity} units and serials`
+      product,
+      inventory: createdInventory,
+      serialsCount: createdSerials.length,
+      message: `Product created successfully with stock in ${createdInventory.length} locations.`
     });
 
   } catch (error) {
+    if (transaction) await transaction.rollback();
     console.error('Error creating product:', error);
-    console.error('Error details:', {
-      message: error.message,
-      stack: error.stack,
-      name: error.name
-    });
-    return res.status(500).json({ 
-      message: 'Internal server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    return res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 
@@ -351,15 +293,10 @@ router.get('/', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, r
   });
   
   try {
-    const { page = 1, limit = 1000, categoryId, subCategoryId, gender, color } = req.query; 
-    const offset = (page - 1) * limit;
-    
-    console.log('Backend: Received limit parameter:', limit);
-    console.log('Backend: Parsed limit:', parseInt(limit));
-    
-    // If limit is 1000 or higher, disable pagination to get all products
-    const shouldPaginate = parseInt(limit) < 1000;
-    console.log('Backend: Should paginate:', shouldPaginate);
+    const { page = 1, limit = 50, categoryId, subCategoryId, gender, color } = req.query; 
+    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+    const limitNum = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+    const offset = (pageNum - 1) * limitNum;
 
     // Build where clause for filtering
     const whereClause = {};
@@ -368,109 +305,107 @@ router.get('/', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, r
     if (gender) whereClause.gender = gender;
     if (color) whereClause.color = color;
 
-    // Get products with conditional pagination
-    const queryOptions = {
+    // Get products with pagination
+    const { count, rows: products } = await Product.findAndCountAll({
       where: whereClause,
       include: [
         {
-          model: require('../models').Category,
+          model: Category,
           as: 'Category',
           attributes: ['id', 'name']
         },
         {
-          model: require('../models').SubCategory,
+          model: SubCategory,
           as: 'SubCategory',
           attributes: ['id', 'name']
         }
       ],
+      limit: limitNum,
+      offset: offset,
       order: [['createdAt', 'DESC']]
-    };
-    
-    // Only add pagination if limit is less than 1000
-    if (shouldPaginate) {
-      queryOptions.limit = parseInt(limit);
-      queryOptions.offset = parseInt(offset);
+    });
+
+    // Batch fetch inventory information for all products in page (eliminates N+1 queries)
+    const productIds = products.map(p => p.id);
+    const inventoryByProduct = {};
+
+    if (productIds.length > 0) {
+      const allInventories = await Inventory.findAll({
+        where: { productId: productIds },
+        include: [
+          {
+            model: Warehouse,
+            as: 'Warehouse',
+            attributes: ['id', 'name', 'type']
+          },
+          {
+            model: Branch,
+            as: 'Branch',
+            attributes: ['id', 'name']
+          }
+        ]
+      });
+
+      for (const inv of allInventories) {
+        if (!inventoryByProduct[inv.productId]) {
+          inventoryByProduct[inv.productId] = [];
+        }
+        inventoryByProduct[inv.productId].push(inv);
+      }
     }
-    
-    const { count, rows: products } = await Product.findAndCountAll(queryOptions);
-    
-    console.log('Backend: Total count from database:', count);
-    console.log('Backend: Products returned:', products.length);
-    
-    // Also check total products without any filters
-    const totalProductsInDB = await Product.count();
-    console.log('Backend: Total products in database (no filters):', totalProductsInDB);
 
-    // Get inventory information for each product
-    const productsWithInventory = await Promise.all(
-      products.map(async (product) => {
-        const inventory = await Inventory.findAll({
-          where: { productId: product.id },
-          include: [
-            {
-              model: require('../models').Warehouse,
-              as: 'Warehouse',
-              attributes: ['id', 'name', 'type']
-            },
-            {
-              model: require('../models').Branch,
-              as: 'Branch',
-              attributes: ['id', 'name']
-            }
-          ]
-        });
+    // Assemble products with grouped inventory
+    const productsWithInventory = products.map((product) => {
+      const inventory = inventoryByProduct[product.id] || [];
+      const totalQuantity = inventory.reduce((sum, inv) => sum + inv.quantity, 0);
 
-        // Calculate total quantity across all warehouses/branches
-        const totalQuantity = inventory.reduce((sum, inv) => sum + inv.quantity, 0);
-
-        return {
-          id: product.id,
-          name: product.name,
-          sku: product.sku,
-          barcode: product.barcode,
-          price: product.price,
-          cost: product.cost,
-          currency: product.currency,
-          category: product.Category ? {
-            id: product.Category.id,
-            name: product.Category.name
+      return {
+        id: product.id,
+        name: product.name,
+        sku: product.sku,
+        barcode: product.barcode,
+        price: product.price,
+        cost: product.cost,
+        currency: product.currency,
+        category: product.Category ? {
+          id: product.Category.id,
+          name: product.Category.name
+        } : null,
+        subCategory: product.SubCategory ? {
+          id: product.SubCategory.id,
+          name: product.SubCategory.name
+        } : null,
+        size: product.size,
+        shoeSize: product.shoeSize,
+        color: product.color,
+        gender: product.gender,
+        isPrinted: product.isPrinted,
+        totalQuantity,
+        inventory: inventory.map(inv => ({
+          id: inv.id,
+          warehouse: inv.Warehouse ? {
+            id: inv.Warehouse.id,
+            name: inv.Warehouse.name,
+            type: inv.Warehouse.type
           } : null,
-          subCategory: product.SubCategory ? {
-            id: product.SubCategory.id,
-            name: product.SubCategory.name
+          branch: inv.Branch ? {
+            id: inv.Branch.id,
+            name: inv.Branch.name
           } : null,
-          size: product.size,
-          shoeSize: product.shoeSize,
-          color: product.color,
-          gender: product.gender,
-          isPrinted: product.isPrinted,
-          totalQuantity,
-          inventory: inventory.map(inv => ({
-            id: inv.id,
-            warehouse: inv.Warehouse ? {
-              id: inv.Warehouse.id,
-              name: inv.Warehouse.name,
-              type: inv.Warehouse.type
-            } : null,
-            branch: inv.Branch ? {
-              id: inv.Branch.id,
-              name: inv.Branch.name
-            } : null,
-            quantity: inv.quantity
-          })),
-          createdAt: product.createdAt,
-          updatedAt: product.updatedAt
-        };
-      })
-    );
+          quantity: inv.quantity
+        })),
+        createdAt: product.createdAt,
+        updatedAt: product.updatedAt
+      };
+    });
 
     return res.json({
       products: productsWithInventory,
       pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(count / limit),
+        currentPage: pageNum,
+        totalPages: Math.ceil(count / limitNum),
         totalItems: count,
-        itemsPerPage: parseInt(limit)
+        itemsPerPage: limitNum
       }
     });
 
@@ -549,12 +484,12 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
         where: serialsWhere,
         include: [
           {
-            model: require('../models').Warehouse,
+            model: Warehouse,
             as: 'Warehouse',
             attributes: ['id', 'name', 'type']
           },
           {
-            model: require('../models').Branch,
+            model: Branch,
             as: 'Branch',
             attributes: ['id', 'name', 'location']
           }
@@ -584,7 +519,7 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
           sku: product.sku,
           barcode: product.barcode,
           price: parseFloat(product.price),
-          cost: parseFloat(product.cost),
+          cost: (req.user.role === ROLES.ADMIN || req.user.role === ROLES.STOCK_KEEPER) ? parseFloat(product.cost) : undefined,
           currency: product.currency,
           category: product.Category ? {
             id: product.Category.id,
@@ -604,7 +539,7 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
         availableSerials: availableSerials.map(serial => ({
           id: serial.id,
           serialCode: serial.serialCode,
-          humanCode: serial.note.split('(')[1]?.replace(')', ''),
+          humanCode: extractHumanCode(serial.note),
           isPrinted: serial.isPrinted,
           status: 'available',
           location: serial.Warehouse ? {
@@ -706,7 +641,7 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
         serial: {
           id: serial.id,
           serialCode: serial.serialCode,
-          humanCode: serial.note.split('(')[1]?.replace(')', ''),
+          humanCode: extractHumanCode(serial.note),
           status: status,
           isPrinted: serial.isPrinted,
           batchId: serial.batchId
@@ -717,7 +652,7 @@ router.get('/search', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER, ROLES.BR
           sku: product.sku,
           barcode: product.barcode,
           price: parseFloat(product.price),
-          cost: parseFloat(product.cost),
+          cost: (req.user.role === ROLES.ADMIN || req.user.role === ROLES.STOCK_KEEPER) ? parseFloat(product.cost) : undefined,
           currency: product.currency,
           category: product.Category ? {
             id: product.Category.id,
@@ -962,12 +897,12 @@ router.get('/branch/:id', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER),
     const product = await Product.findByPk(id, {
       include: [
         {
-          model: require('../models').Category,
+          model: Category,
           as: 'Category',
           attributes: ['id', 'name']
         },
         {
-          model: require('../models').SubCategory,
+          model: SubCategory,
           as: 'SubCategory',
           attributes: ['id', 'name']
         }
@@ -986,7 +921,7 @@ router.get('/branch/:id', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER),
       },
       include: [
         {
-          model: require('../models').Branch,
+          model: Branch,
           as: 'Branch',
           attributes: ['id', 'name', 'location']
         }
@@ -1011,7 +946,7 @@ router.get('/branch/:id', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER),
       },
       include: [
         {
-          model: require('../models').Branch,
+          model: Branch,
           as: 'Branch',
           attributes: ['id', 'name']
         }
@@ -1056,7 +991,7 @@ router.get('/branch/:id', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER),
         serials: serials.map(serial => ({
           id: serial.id,
           serialCode: serial.serialCode,
-          humanCode: serial.note.split('(')[1]?.replace(')', ''),
+          humanCode: extractHumanCode(serial.note),
           note: serial.note,
           isPrinted: serial.isPrinted,
           batchId: serial.batchId,
@@ -1091,12 +1026,12 @@ router.get('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
     const product = await Product.findByPk(id, {
       include: [
         {
-          model: require('../models').Category,
+          model: Category,
           as: 'Category',
           attributes: ['id', 'name']
         },
         {
-          model: require('../models').SubCategory,
+          model: SubCategory,
           as: 'SubCategory',
           attributes: ['id', 'name']
         }
@@ -1112,12 +1047,12 @@ router.get('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
       where: { productId: product.id },
       include: [
         {
-          model: require('../models').Warehouse,
+          model: Warehouse,
           as: 'Warehouse',
           attributes: ['id', 'name', 'type', 'location']
         },
         {
-          model: require('../models').Branch,
+          model: Branch,
           as: 'Branch',
           attributes: ['id', 'name', 'location']
         }
@@ -1132,12 +1067,12 @@ router.get('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
       where: { productId: product.id },
       include: [
         {
-          model: require('../models').Warehouse,
+          model: Warehouse,
           as: 'Warehouse',
           attributes: ['id', 'name', 'type']
         },
         {
-          model: require('../models').Branch,
+          model: Branch,
           as: 'Branch',
           attributes: ['id', 'name']
         }
@@ -1186,7 +1121,7 @@ router.get('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
         serials: serials.map(serial => ({
           id: serial.id,
           serialCode: serial.serialCode,
-          humanCode: serial.note.split('(')[1]?.replace(')', ''),
+          humanCode: extractHumanCode(serial.note),
           note: serial.note,
           isPrinted: serial.isPrinted,
           batchId: serial.batchId,
@@ -1351,7 +1286,6 @@ router.put('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
         }
       }
       if (branchId) {
-        const Branch = require('../models').Branch;
         const branch = await Branch.findByPk(branchId, { transaction });
         if (!branch) {
           await transaction.rollback();
@@ -1386,16 +1320,24 @@ router.put('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
         }
 
         // Generate batch ID for new serials
-        const { v4: uuidv4 } = require('uuid');
-        const newBatchId = uuidv4();
+        const newBatchId = generateBatchId();
 
         // Determine max serial sequence numerically (SQL) to avoid lexicographic sort issues
-        const [maxRow] = await ProductSerial.findAll({
-          attributes: [[require('../models').sequelize.literal('MAX(CAST(SUBSTRING(serial_code, 2, 11) AS UNSIGNED))'), 'maxSeq']],
+        const isSqliteAdd = sequelize.getDialect() === 'sqlite';
+        const serialMaxAttr = isSqliteAdd
+          ? sequelize.literal('MAX(CAST(SUBSTR(serial_code, 2, 11) AS INTEGER))')
+          : sequelize.literal('MAX(CAST(SUBSTR(serial_code, 2, 11) AS UNSIGNED))');
+
+        const serialQueryOpts = {
+          attributes: [[serialMaxAttr, 'maxSeq']],
           raw: true,
-          transaction,
-          lock: transaction.LOCK.UPDATE
-        });
+          transaction
+        };
+        if (!isSqliteAdd) {
+          serialQueryOpts.lock = transaction.LOCK.UPDATE;
+        }
+
+        const [maxRow] = await ProductSerial.findAll(serialQueryOpts);
         let baseSerialSeq = 1;
         if (maxRow && maxRow.maxSeq !== null && maxRow.maxSeq !== undefined) {
           const parsedMax = parseInt(maxRow.maxSeq, 10);
@@ -1483,7 +1425,7 @@ router.put('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
               availableSerials: availableSerials.map(s => ({
                 id: s.id,
                 serialCode: s.serialCode,
-                humanCode: s.note.split('(')[1]?.replace(')', '')
+                humanCode: extractHumanCode(s.note)
               }))
             });
           }
@@ -1604,12 +1546,12 @@ router.put('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
     const updatedProduct = await Product.findByPk(id, {
       include: [
         {
-          model: require('../models').Category,
+          model: Category,
           as: 'Category',
           attributes: ['id', 'name']
         },
         {
-          model: require('../models').SubCategory,
+          model: SubCategory,
           as: 'SubCategory',
           attributes: ['id', 'name']
         }
@@ -1621,12 +1563,12 @@ router.put('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
       where: { productId: updatedProduct.id },
       include: [
         {
-          model: require('../models').Warehouse,
+          model: Warehouse,
           as: 'Warehouse',
           attributes: ['id', 'name', 'type']
         },
         {
-          model: require('../models').Branch,
+          model: Branch,
           as: 'Branch',
           attributes: ['id', 'name']
         }
@@ -1692,13 +1634,15 @@ router.put('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req
 
 // Delete product or reduce quantity (admin, stock_keeper)
 router.delete('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
     const { id } = req.params;
     const { quantity, warehouseId, branchId, deleteAll = false } = req.body || {};
 
     // Find the product
-    const product = await Product.findByPk(id);
+    const product = await Product.findByPk(id, { transaction });
     if (!product) {
+      await transaction.rollback();
       return res.status(404).json({ message: 'Product not found' });
     }
 
@@ -1711,40 +1655,54 @@ router.delete('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (
       where: inventoryConditions,
       include: [
         {
-          model: require('../models').Warehouse,
+          model: Warehouse,
           as: 'Warehouse',
           attributes: ['id', 'name', 'type']
         },
         {
-          model: require('../models').Branch,
+          model: Branch,
           as: 'Branch',
           attributes: ['id', 'name']
         }
-      ]
+      ],
+      transaction
     });
-
-    if (inventoryRecords.length === 0) {
-      return res.status(404).json({ message: 'No inventory found for this product' });
-    }
 
     const totalAvailableQuantity = inventoryRecords.reduce((sum, inv) => sum + inv.quantity, 0);
 
     if (deleteAll) {
-      // Delete all inventory records for this product
-      await Inventory.destroy({
-        where: { productId: product.id }
+      // Check if product was ever ordered in sales
+      const orderItemCount = await OrderItem.count({
+        where: { productId: product.id },
+        transaction
       });
 
-      // Delete all product serials
+      if (orderItemCount > 0) {
+        await transaction.rollback();
+        return res.status(400).json({
+          message: 'Cannot delete product because it has associated sales orders. Consider archiving or setting quantity to 0 instead.'
+        });
+      }
+
+      // Delete inventory records for this product
+      await Inventory.destroy({
+        where: { productId: product.id },
+        transaction
+      });
+
+      // Delete only unassigned product serials
       await ProductSerial.destroy({
-        where: { productId: product.id }
+        where: { productId: product.id, orderItemId: null },
+        transaction
       });
 
       // Delete the product itself
       await Product.destroy({
-        where: { id: product.id }
+        where: { id: product.id },
+        transaction
       });
 
+      await transaction.commit();
       return res.json({
         message: 'Product and all inventory deleted successfully',
         deletedProduct: {
@@ -1756,13 +1714,20 @@ router.delete('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (
       });
     } else {
       // Partial deletion - reduce quantity
+      if (inventoryRecords.length === 0) {
+        await transaction.rollback();
+        return res.status(404).json({ message: 'No inventory found for this product' });
+      }
+
       if (!quantity || quantity <= 0) {
+        await transaction.rollback();
         return res.status(400).json({ 
           message: 'quantity is required and must be greater than 0 for partial deletion' 
         });
       }
 
       if (quantity > totalAvailableQuantity) {
+        await transaction.rollback();
         return res.status(400).json({ 
           message: `Cannot delete ${quantity} units. Only ${totalAvailableQuantity} units available` 
         });
@@ -1786,7 +1751,8 @@ router.delete('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (
             branchId: invRecord.branchId,
             orderItemId: null // Only delete unassigned serials
           },
-          limit: deleteFromThisLocation
+          limit: deleteFromThisLocation,
+          transaction
         });
 
         // Delete the serials
@@ -1794,28 +1760,29 @@ router.delete('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (
           deletedSerials.push({
             id: serial.id,
             serialCode: serial.serialCode,
-            humanCode: serial.note.split('(')[1]?.replace(')', ''),
-            location: invRecord.Warehouse ? invRecord.Warehouse.name : invRecord.Branch.name
+            humanCode: extractHumanCode(serial.note),
+            location: invRecord.Warehouse ? invRecord.Warehouse.name : (invRecord.Branch ? invRecord.Branch.name : 'Unknown')
           });
-          await serial.destroy();
+          await serial.destroy({ transaction });
         }
 
         // Update inventory quantity
         const newQuantity = invRecord.quantity - deleteFromThisLocation;
         if (newQuantity > 0) {
-          await invRecord.update({ quantity: newQuantity });
+          await invRecord.update({ quantity: newQuantity }, { transaction });
           updatedInventory.push({
             id: invRecord.id,
-            location: invRecord.Warehouse ? invRecord.Warehouse.name : invRecord.Branch.name,
+            location: invRecord.Warehouse ? invRecord.Warehouse.name : (invRecord.Branch ? invRecord.Branch.name : 'Unknown'),
             remainingQuantity: newQuantity
           });
         } else {
-          await invRecord.destroy();
+          await invRecord.destroy({ transaction });
         }
 
         remainingToDelete -= deleteFromThisLocation;
       }
 
+      await transaction.commit();
       return res.json({
         message: `Successfully deleted ${quantity} units from inventory`,
         deletedQuantity: quantity,
@@ -1826,6 +1793,9 @@ router.delete('/:id', auth, allowRoles(ROLES.ADMIN, ROLES.STOCK_KEEPER), async (
     }
 
   } catch (error) {
+    if (typeof transaction !== 'undefined' && transaction && !transaction.finished) {
+      try { await transaction.rollback(); } catch (rbErr) {}
+    }
     console.error('Error deleting product:', error);
     return res.status(500).json({ message: 'Internal server error' });
   }
@@ -1890,8 +1860,9 @@ router.get('/search-by-serial/:serialCode', auth, allowRoles(ROLES.CASHIER, ROLE
     });
 
     // Return product with serial information
+    const associatedProduct = serial.Product || serial.product;
     const productData = {
-      ...serial.product.toJSON(),
+      ...(associatedProduct && typeof associatedProduct.toJSON === 'function' ? associatedProduct.toJSON() : (associatedProduct || {})),
       totalQuantity: totalQuantity
     };
 
@@ -1939,12 +1910,12 @@ router.get('/:id/quantity/:locationType/:locationId', auth, allowRoles(ROLES.ADM
       where: whereClause,
       include: [
         {
-          model: require('../models').Warehouse,
+          model: Warehouse,
           as: 'Warehouse',
           attributes: ['id', 'name', 'type']
         },
         {
-          model: require('../models').Branch,
+          model: Branch,
           as: 'Branch',
           attributes: ['id', 'name']
         }

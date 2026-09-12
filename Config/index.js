@@ -3,8 +3,18 @@ require('dotenv').config();
 const database = require('./database');
 
 // JWT Configuration
+const jwtSecret = process.env.JWT_SECRET;
+if (!jwtSecret || jwtSecret === 'your-secret-key') {
+  if (process.env.NODE_ENV === 'production') {
+    console.error('FATAL SECURITY ERROR: JWT_SECRET environment variable must be set to a secure key in production!');
+    process.exit(1);
+  } else {
+    console.warn('⚠️ WARNING: Using default insecure JWT_SECRET. Set JWT_SECRET in .env for production environments.');
+  }
+}
+
 const jwt = {
-  secret: process.env.JWT_SECRET || 'your-secret-key',
+  secret: jwtSecret || 'your-secret-key',
   expiresIn: process.env.JWT_EXPIRES_IN || '24h',
   algorithm: 'HS256'
 };

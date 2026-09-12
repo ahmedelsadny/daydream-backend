@@ -127,7 +127,7 @@ router.get('/', auth, allowRoles(ROLES.ADMIN), async (req, res) => {
         // Group serials by refund ID
         const serialsByRefund = {};
         serials.forEach(serial => {
-            const match = serial.note.match(/refunded - refund (.+)/);
+            const match = serial.note?.match(/refunded - refund (.+)/);
             if (match) {
                 const refundId = match[1];
                 if (!serialsByRefund[refundId]) {
@@ -336,7 +336,7 @@ router.get('/branch', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), asy
         // Group serials by refund ID
         const serialsByRefund = {};
         serials.forEach(serial => {
-            const match = serial.note.match(/refunded - refund (.+)/);
+            const match = serial.note?.match(/refunded - refund (.+)/);
             if (match) {
                 const refundId = match[1];
                 if (!serialsByRefund[refundId]) {

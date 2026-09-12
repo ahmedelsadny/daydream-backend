@@ -181,6 +181,37 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
           message: 'Discount amount cannot be greater than subtotal' 
         });
       }
+
+      // For cashiers, enforce authorized discount ceiling from CashierDiscount
+      if (req.user.role === 'cashier' && discountAmount > 0) {
+        const now = new Date();
+        const activeDiscounts = await CashierDiscount.findAll({
+          where: {
+            cashierId: req.user.id,
+            isActive: true,
+            startDate: { [Op.lte]: now },
+            endDate: { [Op.gte]: now }
+          },
+          transaction
+        });
+
+        if (!activeDiscounts || activeDiscounts.length === 0) {
+          await transaction.rollback();
+          return res.status(403).json({
+            message: 'You are not authorized to apply discounts. No active discount permission found for your account.'
+          });
+        }
+
+        const maxAllowedPercentage = Math.max(...activeDiscounts.map(d => parseFloat(d.discountPercentage) || 0));
+        if (discountPercentage > (maxAllowedPercentage + 0.01)) {
+          await transaction.rollback();
+          return res.status(403).json({
+            message: `Discount percentage (${discountPercentage.toFixed(2)}%) exceeds your maximum allowed limit of ${maxAllowedPercentage}%`
+          });
+        }
+
+        cashierDiscountId = activeDiscounts[0].id;
+      }
     }
     // Option 2: Use cashier discount system (legacy/optional)
     else if (applyDiscount === true) {

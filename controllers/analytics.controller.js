@@ -12,25 +12,6 @@ const router = express.Router();
 
 console.log('🔧 Analytics controller loaded - daily-report route will be available at /api/v1/analytics/daily-report');
 
-// Test route without authentication to verify route registration
-router.get('/test-daily-report-no-auth', (req, res) => {
-  res.json({ success: true, message: 'Daily report route is registered!', query: req.query });
-});
-
-router.get('/test-sales', async (req, res) => {
-  const dateGrouping = sequelize.fn('strftime', '%Y-%m-%d', sequelize.col('created_at'));
-  const salesByPeriod = await Order.findAll({
-    attributes: [
-      [dateGrouping, 'period'],
-      [sequelize.fn('COUNT', sequelize.col('Order.id')), 'orderCount']
-    ],
-    group: [dateGrouping],
-    raw: true
-  });
-  const allOrders = await Order.findAll({ limit: 5, raw: true });
-  res.json({ salesByPeriod, allOrders });
-});
-
 // All analytics endpoints are admin-only
 router.use(auth, allowRoles(ROLES.ADMIN));
 

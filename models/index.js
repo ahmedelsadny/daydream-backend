@@ -59,7 +59,7 @@ if (User) {
 }
 
 if (Customer && Order) {
-  Customer.hasMany(Order, { foreignKey: "customerId", onDelete: "CASCADE" });
+  Customer.hasMany(Order, { foreignKey: "customerId", onDelete: "SET NULL" });
   Order.belongsTo(Customer, { foreignKey: "customerId" });
 }
 
@@ -73,7 +73,7 @@ if (Branch && User) {
 }
 
 if (Branch && Order) {
-  Branch.hasMany(Order, { foreignKey: "branchId", onDelete: "CASCADE" });
+  Branch.hasMany(Order, { foreignKey: "branchId", onDelete: "RESTRICT" });
   Order.belongsTo(Branch, { foreignKey: "branchId" });
 }
 
@@ -118,7 +118,7 @@ if (Order && OrderItem) {
 
 if (OrderItem && Product) {
   OrderItem.belongsTo(Product, { foreignKey: "productId" });
-  Product.hasMany(OrderItem, { foreignKey: "productId" });
+  Product.hasMany(OrderItem, { foreignKey: "productId", onDelete: "RESTRICT" });
 }
 
 if (Refund && OrderItem) {
@@ -194,7 +194,7 @@ if (ProductSerial && Product) {
   ProductSerial.belongsTo(Product, { foreignKey: "productId" });
   Product.hasMany(ProductSerial, {
     foreignKey: "productId",
-    onDelete: "CASCADE",
+    onDelete: "RESTRICT",
   });
 }
 

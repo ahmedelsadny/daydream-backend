@@ -1453,7 +1453,7 @@ router.get('/', auth, allowRoles(ROLES.ADMIN), async (req, res) => {
         // Group serials by new order ID, then map to replacement
         const serialsByNewOrderId = {};
         returnedSerials.forEach(serial => {
-            const match = serial.note.match(/via replacement ([a-f0-9-]+)/i);
+            const match = serial.note?.match(/via replacement ([a-f0-9-]+)/i);
             if (match) {
                 const newOrderId = match[1];
                 if (!serialsByNewOrderId[newOrderId]) {
@@ -1661,7 +1661,7 @@ router.get('/branch', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), asy
         // Group serials by new order ID, then map to replacement
         const serialsByNewOrderId = {};
         returnedSerials.forEach(serial => {
-            const match = serial.note.match(/via replacement ([a-f0-9-]+)/i);
+            const match = serial.note?.match(/via replacement ([a-f0-9-]+)/i);
             if (match) {
                 const newOrderId = match[1];
                 if (!serialsByNewOrderId[newOrderId]) {
