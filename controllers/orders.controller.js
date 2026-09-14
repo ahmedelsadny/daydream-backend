@@ -1510,4 +1510,3 @@ router.get('/:id/receipt', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER,
 });
 
 module.exports = router;
-
