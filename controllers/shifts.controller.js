@@ -3,6 +3,7 @@ const { Shift, User, Branch, Order, OrderItem, Product, Refund, Replacement, Cas
 const auth = require('../middleware/auth');
 const { allowRoles, ROLES } = require('../middleware/roles');
 const { logAuditEvent } = require('../utils/auditLogger');
+const { generateZReportReceipt } = require('../services/receiptGenerator');
 const { Op } = require('sequelize');
 
 const router = express.Router();
@@ -607,52 +608,64 @@ router.post('/end', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER), async
 
     const differenceStatus = cashDifference > 0 ? 'surplus' : (cashDifference < 0 ? 'shortage' : 'balanced');
 
+    const zReportObj = {
+      shiftId: shift.id,
+      cashier: {
+        id: user.id,
+        name: user.name,
+        email: user.email
+      },
+      branch: {
+        id: branch.id,
+        name: branch.name,
+        location: branch.location
+      },
+      timing: {
+        startTime: shift.startTime,
+        endTime: shift.endTime,
+        durationHours: ((new Date(shift.endTime) - new Date(shift.startTime)) / (1000 * 60 * 60)).toFixed(2)
+      },
+      drawerReconciliation: {
+        openingBalance: openingBal,
+        cashSales: parseFloat(cashSales.toFixed(2)),
+        cashRefunds: parseFloat(totalRefunds.toFixed(2)),
+        cashIn: totalCashIn,
+        cashOut: totalCashOut,
+        expectedCash: parseFloat(expectedCash.toFixed(2)),
+        actualCashCounted: actualClosing,
+        difference: cashDifference,
+        status: differenceStatus
+      },
+      salesSummary: {
+        totalOrders: orders.length,
+        totalSubtotal: parseFloat(totalSubtotal.toFixed(2)),
+        totalDiscounts: parseFloat(totalDiscounts.toFixed(2)),
+        totalSales: parseFloat(totalSales.toFixed(2)),
+        cashSales: parseFloat(cashSales.toFixed(2)),
+        visaSales: parseFloat(visaSales.toFixed(2)),
+        netSales: parseFloat(netSales.toFixed(2))
+      },
+      refundsSummary: {
+        count: refunds.length,
+        totalAmount: parseFloat(totalRefunds.toFixed(2))
+      },
+      cashTransactionsCount: cashTransactions.length,
+      notes: shift.notes
+    };
+
+    // Generate physical thermal Z-report receipt
+    let zReportReceipt = null;
+    try {
+      const paperWidth = parseInt(req.body.paperWidth) || 48;
+      zReportReceipt = await generateZReportReceipt(zReportObj, null, paperWidth);
+    } catch (receiptErr) {
+      console.error('Warning: Error generating Z-report receipt payload:', receiptErr.message);
+    }
+
     return res.json({
       message: 'Shift ended successfully',
-      zReport: {
-        shiftId: shift.id,
-        cashier: {
-          id: user.id,
-          name: user.name,
-          email: user.email
-        },
-        branch: {
-          id: branch.id,
-          name: branch.name,
-          location: branch.location
-        },
-        timing: {
-          startTime: shift.startTime,
-          endTime: shift.endTime,
-          durationHours: ((new Date(shift.endTime) - new Date(shift.startTime)) / (1000 * 60 * 60)).toFixed(2)
-        },
-        drawerReconciliation: {
-          openingBalance: openingBal,
-          cashSales: parseFloat(cashSales.toFixed(2)),
-          cashRefunds: parseFloat(totalRefunds.toFixed(2)),
-          cashIn: totalCashIn,
-          cashOut: totalCashOut,
-          expectedCash: parseFloat(expectedCash.toFixed(2)),
-          actualCashCounted: actualClosing,
-          difference: cashDifference,
-          status: differenceStatus
-        },
-        salesSummary: {
-          totalOrders: orders.length,
-          totalSubtotal: parseFloat(totalSubtotal.toFixed(2)),
-          totalDiscounts: parseFloat(totalDiscounts.toFixed(2)),
-          totalSales: parseFloat(totalSales.toFixed(2)),
-          cashSales: parseFloat(cashSales.toFixed(2)),
-          visaSales: parseFloat(visaSales.toFixed(2)),
-          netSales: parseFloat(netSales.toFixed(2))
-        },
-        refundsSummary: {
-          count: refunds.length,
-          totalAmount: parseFloat(totalRefunds.toFixed(2))
-        },
-        cashTransactionsCount: cashTransactions.length,
-        notes: shift.notes
-      },
+      zReport: zReportObj,
+      receipt: zReportReceipt,
       shift: {
         id: shift.id,
         startTime: shift.startTime,
@@ -1223,6 +1236,65 @@ router.post('/drawer-open', auth, allowRoles(ROLES.ADMIN, ROLES.BRANCH_MANAGER, 
       message: 'Internal server error',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
+  }
+});
+
+// Get thermal Z-report receipt payload for reprinting past shift (cashier, branch_manager, admin)
+router.get('/:id/z-report-receipt', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER, ROLES.ADMIN), async (req, res) => {
+  try {
+    const paperWidth = parseInt(req.query.paperWidth) || 48;
+    const shift = await Shift.findByPk(req.params.id, {
+      include: [
+        { model: User, as: 'cashier', attributes: ['id', 'name', 'email'] },
+        { model: Branch, as: 'branch', attributes: ['id', 'name', 'location'] }
+      ]
+    });
+
+    if (!shift) {
+      return res.status(404).json({ message: 'Shift not found' });
+    }
+
+    const differenceStatus = parseFloat(shift.cashDifference || 0) > 0 ? 'surplus' : (parseFloat(shift.cashDifference || 0) < 0 ? 'shortage' : 'balanced');
+    const zReportObj = {
+      shiftId: shift.id,
+      cashier: shift.cashier,
+      branch: shift.branch,
+      timing: {
+        startTime: shift.startTime,
+        endTime: shift.endTime,
+        durationHours: shift.endTime ? ((new Date(shift.endTime) - new Date(shift.startTime)) / (1000 * 60 * 60)).toFixed(2) : 'Active'
+      },
+      drawerReconciliation: {
+        openingBalance: parseFloat(shift.openingBalance || 0),
+        cashSales: parseFloat(shift.cashSales || 0),
+        cashRefunds: parseFloat(shift.totalRefunds || 0),
+        cashIn: parseFloat(shift.cashIn || 0),
+        cashOut: parseFloat(shift.cashOut || 0),
+        expectedCash: parseFloat(shift.expectedBalance || 0),
+        actualCashCounted: shift.closingBalance !== null ? parseFloat(shift.closingBalance) : null,
+        difference: parseFloat(shift.cashDifference || 0),
+        status: differenceStatus
+      },
+      salesSummary: {
+        totalOrders: shift.totalOrders || 0,
+        totalSubtotal: parseFloat(shift.totalSubtotal || 0),
+        totalDiscounts: parseFloat(shift.totalDiscounts || 0),
+        totalSales: parseFloat(shift.totalSales || 0),
+        cashSales: parseFloat(shift.cashSales || 0),
+        netSales: parseFloat(shift.netSales || 0)
+      },
+      notes: shift.notes
+    };
+
+    const receipt = await generateZReportReceipt(zReportObj, null, paperWidth);
+
+    return res.json({
+      shiftId: shift.id,
+      receipt
+    });
+  } catch (error) {
+    console.error('Error reprinting Z-report:', error);
+    return res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 

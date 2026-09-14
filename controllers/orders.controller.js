@@ -5,6 +5,7 @@ const { allowRoles, ROLES } = require('../middleware/roles');
 const { requireSupervisorPin } = require('../middleware/supervisorPin');
 const { logAuditEvent } = require('../utils/auditLogger');
 const { evaluatePromotions } = require('../services/promotionEngine');
+const { generateReceiptPayload } = require('../services/receiptGenerator');
 const { Op } = require('sequelize');
 
 const router = express.Router();
@@ -14,7 +15,23 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
   const transaction = await sequelize.transaction();
 
   try {
-    const { customerId, paymentMethod, cashAmount, visaAmount, items, amountPaid, applyDiscount, cashierDiscountId: requestedDiscountId, discountAmount: frontendDiscountAmount } = req.body;
+    let { 
+      customerId, 
+      paymentMethod = 'cash', 
+      cashAmount, 
+      visaAmount, 
+      items, 
+      amountPaid, 
+      applyDiscount, 
+      cashierDiscountId: requestedDiscountId, 
+      discountAmount: frontendDiscountAmount,
+      paperWidth = 48 
+    } = req.body;
+
+    // Default to cash if empty or null
+    if (!paymentMethod) {
+      paymentMethod = 'cash';
+    }
 
     console.log('🔍 Order request received:');
     console.log('  customerId:', customerId, 'Type:', typeof customerId);
@@ -29,10 +46,18 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
       });
     }
 
-    // Validate required fields
-    if (!paymentMethod || !['cash', 'visa', 'mixed', 'customer_credit'].includes(paymentMethod)) {
+    // Disallow credit/tab sale in cash-only supermarket mode
+    if (paymentMethod === 'customer_credit') {
       await transaction.rollback();
-      return res.status(400).json({ message: 'paymentMethod must be cash, visa, mixed, or customer_credit' });
+      return res.status(400).json({ 
+        message: 'البيع بالآجل والشكك غير مفعل. النظام يعمل بالدفع النقدي (كاش) فقط.' 
+      });
+    }
+
+    // Validate required fields
+    if (!['cash', 'visa', 'mixed'].includes(paymentMethod)) {
+      await transaction.rollback();
+      return res.status(400).json({ message: 'طريقة الدفع غير صالحة. النظام يدعم الدفع النقدي (cash).' });
     }
     if (!items || !Array.isArray(items) || items.length === 0) {
       await transaction.rollback();
@@ -617,6 +642,34 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
 
     console.log('Backend: Order completed successfully');
 
+    // Generate ESC/POS Thermal Receipt Payload for instant printing & automatic drawer kick
+    let receipt = null;
+    try {
+      const branch = await Branch.findByPk(req.user.branchId);
+      const orderPayloadForReceipt = {
+        id: order.id,
+        subtotal: subtotal,
+        totalPrice: totalPrice,
+        discountAmount: discountAmount,
+        promotionDiscount: totalPromotionDiscount || 0.00,
+        amountPaid: actualAmountPaid,
+        changeAmount: changeAmount,
+        createdAt: order.createdAt,
+        Branch: branch,
+        cashier: req.user,
+        OrderItems: createdItems.map(ci => ({
+          name: ci.productName,
+          quantity: ci.quantity,
+          unitPrice: ci.unitPrice,
+          totalPrice: ci.subtotal,
+          Product: { name: ci.productName, sku: ci.sku, price: ci.unitPrice }
+        }))
+      };
+      receipt = await generateReceiptPayload(orderPayloadForReceipt, null, parseInt(paperWidth) || 48);
+    } catch (receiptErr) {
+      console.error('Warning: could not generate ESC/POS receipt payload:', receiptErr.message);
+    }
+
     return res.status(201).json({
       order: {
         id: order.id,
@@ -648,6 +701,7 @@ router.post('/', auth, allowRoles(ROLES.BRANCH_MANAGER, ROLES.CASHIER), async (r
         loyaltyPoints: (customer.loyaltyPoints || 0) + pointsEarned,
         pointsEarned: pointsEarned
       } : null,
+      receipt: receipt,
       message: 'Order created successfully'
     });
 
@@ -1422,6 +1476,36 @@ router.post('/void-item', auth, allowRoles(ROLES.ADMIN, ROLES.BRANCH_MANAGER, RO
   } catch (error) {
     console.error('Error recording item void:', error);
     return res.status(500).json({ message: 'Internal server error' });
+  }
+// Get receipt payload for reprinting or previewing an order (cashier, branch_manager, admin)
+router.get('/:id/receipt', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER, ROLES.ADMIN), async (req, res) => {
+  try {
+    const paperWidth = parseInt(req.query.paperWidth) || 48;
+    const order = await Order.findByPk(req.params.id, {
+      include: [
+        { model: Branch },
+        { model: User, as: 'cashier', attributes: ['id', 'name', 'email'] },
+        { model: Customer, attributes: ['id', 'name', 'phone'] },
+        {
+          model: OrderItem,
+          include: [{ model: Product, attributes: ['id', 'name', 'sku', 'price'] }]
+        }
+      ]
+    });
+
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    const receipt = await generateReceiptPayload(order, null, paperWidth);
+    return res.json({
+      orderId: order.id,
+      orderNumber: `ORD-${order.id.substring(0, 8).toUpperCase()}`,
+      receipt
+    });
+  } catch (error) {
+    console.error('Error generating receipt for order:', error);
+    return res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 
