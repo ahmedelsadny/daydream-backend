@@ -7,7 +7,11 @@ export default function LoginModal() {
   const { user, handleLogin } = usePos();
   const [email, setEmail] = useState('cashier@daydream.com');
   const [password, setPassword] = useState('password123');
-  const [apiBaseUrl, setApiBaseUrl] = useState('http://localhost:5000/api/v1');
+  const [apiBaseUrl, setApiBaseUrl] = useState(() => {
+    const saved = localStorage.getItem('DAYDREAM_API_BASE');
+    if (saved && !saved.includes(':5000')) return saved;
+    return 'http://localhost:8090/api/v1';
+  });
   const [showConfig, setShowConfig] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
@@ -114,7 +118,7 @@ export default function LoginModal() {
                   style={{ marginTop: '0.5rem', width: '100%', direction: 'ltr', textAlign: 'left', fontSize: '0.85rem' }}
                   value={apiBaseUrl}
                   onChange={(e) => setApiBaseUrl(e.target.value)}
-                  placeholder="http://localhost:5000/api/v1"
+                  placeholder="http://localhost:8090/api/v1"
                 />
               )}
             </div>

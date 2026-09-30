@@ -4,10 +4,12 @@
  */
 
 const getApiBase = () => {
+  const envBase = import.meta.env?.VITE_API_BASE_URL;
+  if (envBase) return envBase;
   const saved = localStorage.getItem('DAYDREAM_API_BASE');
-  if (saved) return saved;
-  // Default to localhost:5000 if not specified
-  return 'http://localhost:5000/api/v1';
+  if (saved && !saved.includes(':5000')) return saved;
+  // Default to backend on 8090
+  return 'http://localhost:8090/api/v1';
 };
 
 export const API_BASE = getApiBase();
@@ -61,10 +63,14 @@ export const posApi = {
     body: JSON.stringify({ email, password })
   }),
 
+  // Categories
+  fetchCategories: () => request('/categories'),
+
   // Products & Barcodes
   fetchProducts: () => request('/products?limit=1000'),
   fetchFavorites: () => request('/products/favorites'),
-  findProductByBarcode: (barcode) => request(`/products/search/code?barcode=${encodeURIComponent(barcode)}`),
+  fetchProductsByCategory: (categoryId) => request(`/products?categoryId=${categoryId}&limit=200`),
+  findProductByBarcode: (barcode) => request(`/products/search?code=${encodeURIComponent(barcode)}`),
 
   // Live POS Sales & Orders
   createOrder: (orderPayload) => request('/orders', {

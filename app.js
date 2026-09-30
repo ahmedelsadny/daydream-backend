@@ -8,7 +8,7 @@ const createError = require('http-errors');
 
 const { server, logging } = require('./Config');
 const db = require('./models');
-const { ensureAdminUser, ensureSupermarketSchema } = require('./Config/bootstrap');
+const { ensureAdminUser, ensureCashierUser, ensureSupermarketSchema } = require('./Config/bootstrap');
 const apiRouter = express.Router();
 
 const app = express();
@@ -124,6 +124,10 @@ if (require.main === module) {
       console.log('🔄 Ensuring admin user exists...');
       await ensureAdminUser();
       console.log('✅ Admin user check complete!');
+
+      console.log('🔄 Ensuring cashier user exists...');
+      await ensureCashierUser();
+      console.log('✅ Cashier user check complete!');
 
       app.listen(server.port, server.host, () => {
         // eslint-disable-next-line no-console

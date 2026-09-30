@@ -1477,6 +1477,8 @@ router.post('/void-item', auth, allowRoles(ROLES.ADMIN, ROLES.BRANCH_MANAGER, RO
     console.error('Error recording item void:', error);
     return res.status(500).json({ message: 'Internal server error' });
   }
+});
+
 // Get receipt payload for reprinting or previewing an order (cashier, branch_manager, admin)
 router.get('/:id/receipt', auth, allowRoles(ROLES.CASHIER, ROLES.BRANCH_MANAGER, ROLES.ADMIN), async (req, res) => {
   try {

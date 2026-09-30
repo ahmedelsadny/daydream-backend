@@ -1,5 +1,5 @@
 const bcrypt = require('bcryptjs');
-const { User } = require('../models');
+const { User, Branch, Warehouse } = require('../models');
 const { ROLES } = require('../middleware/roles');
 
 async function ensureAdminUser() {
@@ -22,6 +22,53 @@ async function ensureAdminUser() {
     branchId: null,
     warehouseId: null
   });
+}
+
+async function ensureCashierUser() {
+  try {
+    let branch = await Branch.findOne();
+    if (!branch) {
+      let warehouse = await Warehouse.findOne();
+      if (!warehouse) {
+        warehouse = await Warehouse.create({
+          name: 'المستودع الرئيسي',
+          location: 'المركز الرئيسي',
+          type: 'central'
+        });
+      }
+      branch = await Branch.create({
+        name: 'الفرع الرئيسي - سوبر ماركت',
+        location: 'المركز الرئيسي',
+        warehouseId: warehouse.id
+      });
+    }
+
+    const email = 'cashier@daydream.com';
+    let cashier = await User.findOne({ where: { email } });
+    const hashedPassword = await bcrypt.hash('password123', 10);
+    const hashedPin = await bcrypt.hash('1234', 10);
+
+    const userData = {
+      name: 'كاشير 1',
+      email: email,
+      password: hashedPassword,
+      passwordHash: hashedPassword,
+      role: ROLES.CASHIER || 'cashier',
+      branchId: branch.id,
+      supervisorPin: hashedPin
+    };
+
+    if (cashier) {
+      await cashier.update(userData);
+      console.log('🔄 [Bootstrap] تم تحديث وربط حساب الكاشير بالفرع بنجاح');
+    } else {
+      await User.create(userData);
+      console.log('✨ [Bootstrap] تم إنشاء مستخدم الكاشير بنجاح');
+    }
+    console.log('🔑 [Bootstrap] بيانات دخول الكاشير: cashier@daydream.com / password123 | PIN: 1234');
+  } catch (err) {
+    console.log('⚠️ [Bootstrap] Cashier setup note:', err.message);
+  }
 }
 
 async function ensureSupermarketSchema(sequelize) {
@@ -132,6 +179,7 @@ async function ensureSupermarketSchema(sequelize) {
 
 module.exports = {
   ensureAdminUser,
+  ensureCashierUser,
   ensureSupermarketSchema
 };
 

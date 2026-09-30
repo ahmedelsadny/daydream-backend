@@ -1,3 +1,4 @@
+const express = require('express');
 const { 
   Order, OrderItem, Product, Customer, Branch, User, 
   Shift, Category, SubCategory, Inventory, sequelize, Sequelize,
@@ -1673,6 +1674,8 @@ router.get('/detailed-report', async (req, res) => {
       error: error.message
     });
   }
+});
+
 // ==================== TRUE NET PROFIT REPORT ====================
 /**
  * GET /api/v1/analytics/net-profit

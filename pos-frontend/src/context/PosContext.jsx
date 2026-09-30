@@ -26,6 +26,7 @@ export function PosProvider({ children }) {
   // Local Product Catalog Cache (0ms Instant Barcode Response)
   const [productsCache, setProductsCache] = useState([]);
   const [favorites, setFavorites] = useState([]);
+  const [categories, setCategories] = useState([]);
   const [heldOrders, setHeldOrders] = useState([]);
 
   // Modals Visibility
@@ -95,7 +96,15 @@ export function PosProvider({ children }) {
         console.warn('Could not cache products:', prodErr.message);
       }
 
-      // 3. Load favorites
+      // 3. Load categories from API
+      try {
+        const catRes = await posApi.fetchCategories();
+        setCategories(catRes.categories || []);
+      } catch (catErr) {
+        console.warn('Could not load categories:', catErr.message);
+      }
+
+      // 4. Load favorites
       try {
         const favRes = await posApi.fetchFavorites();
         setFavorites(favRes.favorites || []);
@@ -103,7 +112,7 @@ export function PosProvider({ children }) {
         console.warn('Could not load favorites:', favErr.message);
       }
 
-      // 4. Load held orders
+      // 5. Load held orders
       try {
         const heldRes = await posApi.getHeldOrders();
         setHeldOrders(heldRes.heldOrders || []);
@@ -372,6 +381,7 @@ export function PosProvider({ children }) {
     processBarcodeScan,
     productsCache,
     favorites,
+    categories,
     // Hold / Recall
     heldOrders,
     holdCurrentCart,
